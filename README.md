@@ -99,7 +99,7 @@ This entire system is built using **Snowflake CoCo prompts**.
 We also implemented:
 
 * Custom Skill (`SKILL.md`)
-* Agent configuration (`AGENTS.md`)
+* Reference (`REFERENCE.md`)
 * Knowledge base-driven AI prompting
 
 This enables:
@@ -119,22 +119,14 @@ Run the full deployment script:
 
 ```sql
 -- Run this in Snowflake worksheet
-deployment.sql
+code.sql
 ```
 
 ---
 
-### 2. Generate Sample Failures
-
-Run:
-
-```sql
-sample_queries.sql
-```
-
 ---
 
-### 3. Verify System
+### 2. Verify System
 
 ```sql
 SELECT * FROM OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_METRICS;
@@ -142,7 +134,7 @@ SELECT * FROM OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_METRICS;
 
 ---
 
-### 4. Run Streamlit Dashboard
+### 3. Run Streamlit Dashboard
 
 In Snowflake:
 
@@ -153,7 +145,7 @@ CREATE STREAMLIT ...
 Or locally:
 
 ```bash
-streamlit run streamlit_app.py
+streamlit run streamlit.py
 ```
 
 ---
