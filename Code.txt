@@ -1,0 +1,1873 @@
+﻿icked -- ============================================================================
+-- CORTEX SENTINAI — Detect. Diagnose. Auto-Resolve.
+-- Your pipelines never sleep. Neither does SentinAI.
+-- Complete deployment script for OPS_AI_MONITOR
+-- ============================================================================
+
+
+-- ============================================================================
+-- SECTION 1: INFRASTRUCTURE
+-- ============================================================================
+
+
+USE ROLE ACCOUNTADMIN;
+
+
+CREATE DATABASE IF NOT EXISTS OPS_AI_MONITOR
+    DATA_RETENTION_TIME_IN_DAYS = 14
+    COMMENT = 'AI-powered pipeline failure monitoring system';
+
+
+CREATE SCHEMA IF NOT EXISTS OPS_AI_MONITOR.EVENT_LOGS
+    COMMENT = 'Raw failure events from queries, tasks, and system sources';
+
+
+CREATE SCHEMA IF NOT EXISTS OPS_AI_MONITOR.AI_ENGINE
+    COMMENT = 'Cortex AI enrichment outputs and classified failure insights';
+
+
+CREATE SCHEMA IF NOT EXISTS OPS_AI_MONITOR.METADATA
+    COMMENT = 'Reference and configuration tables for the monitoring pipeline';
+
+
+CREATE SCHEMA IF NOT EXISTS OPS_AI_MONITOR.DEMO_ERRORS
+    COMMENT = 'Schema for demo error generation across all pipeline types';
+
+
+CREATE WAREHOUSE IF NOT EXISTS OPS_MONITOR_WH
+    WAREHOUSE_SIZE = 'XSMALL'
+    AUTO_SUSPEND = 60
+    AUTO_RESUME = TRUE
+    INITIALLY_SUSPENDED = TRUE
+    COMMENT = 'Dedicated warehouse for pipeline failure monitoring workloads';
+
+
+GRANT USAGE ON DATABASE OPS_AI_MONITOR TO ROLE SYSADMIN;
+GRANT USAGE ON SCHEMA OPS_AI_MONITOR.EVENT_LOGS TO ROLE SYSADMIN;
+GRANT USAGE ON SCHEMA OPS_AI_MONITOR.AI_ENGINE TO ROLE SYSADMIN;
+GRANT USAGE ON SCHEMA OPS_AI_MONITOR.METADATA TO ROLE SYSADMIN;
+GRANT USAGE ON WAREHOUSE OPS_MONITOR_WH TO ROLE SYSADMIN;
+
+
+CREATE NOTIFICATION INTEGRATION IF NOT EXISTS OPS_ALERT_EMAIL
+    TYPE = EMAIL
+    ENABLED = TRUE;
+
+
+-- Slack Webhook Secret & Integration
+CREATE OR REPLACE SECRET OPS_AI_MONITOR.METADATA.SLACK_WEBHOOK_SECRET
+  TYPE = GENERIC_STRING
+  SECRET_STRING = '<YOUR_SLACK_TOKEN_HERE>';
+
+
+CREATE OR REPLACE NOTIFICATION INTEGRATION OPS_SLACK_ALERTS
+  TYPE = WEBHOOK
+  ENABLED = TRUE
+  WEBHOOK_URL = 'https://hooks.slack.com/services/SNOWFLAKE_WEBHOOK_SECRET'
+  WEBHOOK_SECRET = OPS_AI_MONITOR.METADATA.SLACK_WEBHOOK_SECRET
+  WEBHOOK_BODY_TEMPLATE = 'SNOWFLAKE_WEBHOOK_MESSAGE'
+  WEBHOOK_HEADERS = ('Content-Type'='application/json')
+  COMMENT = 'CoCo Pipeline Alert notifications to Slack';
+
+
+-- ============================================================================
+-- SECTION 2: TABLES
+-- ============================================================================
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS (
+    EVENT_ID       VARCHAR(256)  NOT NULL,
+    SOURCE_TYPE    VARCHAR(50)   NOT NULL,
+    ERROR_MESSAGE  VARCHAR(16777216),
+    QUERY_TEXT     VARCHAR(16777216),
+    USER_NAME      VARCHAR(256),
+    WAREHOUSE_NAME VARCHAR(256),
+    DATABASE_NAME  VARCHAR(256),
+    SCHEMA_NAME    VARCHAR(256),
+    START_TIME     TIMESTAMP_LTZ NOT NULL,
+    CREATED_AT     TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_FAILURE_EVENTS PRIMARY KEY (EVENT_ID, SOURCE_TYPE)
+)
+CLUSTER BY (START_TIME::DATE, SOURCE_TYPE)
+DATA_RETENTION_TIME_IN_DAYS = 14
+CHANGE_TRACKING = TRUE
+COMMENT = 'Persisted failure events from all monitored sources';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.EVENT_LOGS.STALE_STREAMS (
+    STREAM_NAME     VARCHAR(512) NOT NULL,
+    DATABASE_NAME   VARCHAR(256),
+    SCHEMA_NAME     VARCHAR(256),
+    STALE_SINCE     TIMESTAMP_LTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    DETECTED_AT     TIMESTAMP_LTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_STALE_STREAMS PRIMARY KEY (STREAM_NAME)
+)
+COMMENT = 'Tracks stale streams detected during monitoring sweeps';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.EVENT_LOGS.CUSTOM_LOGS (
+    EVENT_ID       VARCHAR(256)     NOT NULL DEFAULT UUID_STRING(),
+    PIPELINE_NAME  VARCHAR(512)     NOT NULL,
+    SOURCE_SYSTEM  VARCHAR(50)      NOT NULL,
+    ERROR_MESSAGE  VARCHAR(16777216),
+    QUERY_TEXT     VARCHAR(16777216),
+    STATUS         VARCHAR(20)      NOT NULL DEFAULT 'FAILED',
+    USER_NAME      VARCHAR(256),
+    WAREHOUSE_NAME VARCHAR(256),
+    DATABASE_NAME  VARCHAR(256),
+    SCHEMA_NAME    VARCHAR(256),
+    START_TIME     TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CREATED_AT     TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_CUSTOM_LOGS PRIMARY KEY (EVENT_ID)
+)
+CHANGE_TRACKING = TRUE
+COMMENT = 'External pipeline failure logs from Fivetran, dbt, custom ETL systems';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS (
+    EVENT_ID         VARCHAR(256)     NOT NULL,
+    ROOT_CAUSE       VARCHAR(16777216),
+    SEVERITY         VARCHAR(20),
+    SUGGESTED_FIX    VARCHAR(16777216),
+    FIX_SQL          VARCHAR(16777216),
+    TEST_SQL         VARCHAR(16777216),
+    CONFIDENCE_SCORE FLOAT,
+    RAW_RESPONSE     VARIANT,
+    STATUS           VARCHAR(10)      NOT NULL DEFAULT 'PENDING',
+    RETRY_COUNT      NUMBER(2,0)      NOT NULL DEFAULT 0,
+    CREATED_AT       TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_AT       TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_ERROR_ANALYSIS PRIMARY KEY (EVENT_ID)
+)
+CLUSTER BY (CREATED_AT::DATE, STATUS)
+DATA_RETENTION_TIME_IN_DAYS = 14
+CHANGE_TRACKING = TRUE
+COMMENT = 'Cortex AI analysis results for pipeline failure events';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.AI_ENGINE.ALERT_LOG (
+    EVENT_ID     VARCHAR(256)  NOT NULL,
+    ALERT_FLAG   VARCHAR(10),
+    ISSUE_TYPE   VARCHAR(100),
+    ALERTED_AT   TIMESTAMP_LTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_ALERT_LOG PRIMARY KEY (EVENT_ID)
+)
+COMMENT = 'Tracks sent alerts to prevent duplicate notifications';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS (
+    EVENT_ID         VARCHAR(256)     NOT NULL,
+    FIX_SQL          VARCHAR(16777216) NOT NULL,
+    EXECUTION_STATUS VARCHAR(20)      NOT NULL,
+    ERROR_MESSAGE    VARCHAR(16777216),
+    EXECUTED_AT      TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_AUTO_FIX_LOGS PRIMARY KEY (EVENT_ID)
+)
+COMMENT = 'Tracks AI-suggested fixes that were auto-executed and their outcomes';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE (
+    APPROVAL_ID       VARCHAR(256)     NOT NULL DEFAULT UUID_STRING(),
+    EVENT_ID          VARCHAR(256)     NOT NULL,
+    PIPELINE_TYPE     VARCHAR(50),
+    SEVERITY          VARCHAR(20)      NOT NULL,
+    CONFIDENCE_SCORE  FLOAT,
+    ROOT_CAUSE        VARCHAR(16777216),
+    SUGGESTED_FIX     VARCHAR(16777216),
+    FIX_SQL           VARCHAR(16777216) NOT NULL,
+    APPROVAL_STATUS   VARCHAR(20)      NOT NULL DEFAULT 'PENDING',
+    APPROVAL_POLICY   VARCHAR(20)      NOT NULL DEFAULT 'MANUAL',
+    APPROVED_BY       VARCHAR(256),
+    APPROVED_AT       TIMESTAMP_LTZ,
+    REJECTION_REASON  VARCHAR(16777216),
+    EXECUTED          BOOLEAN          NOT NULL DEFAULT FALSE,
+    CREATED_AT        TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_FIX_APPROVAL PRIMARY KEY (APPROVAL_ID)
+)
+COMMENT = 'Human-in-the-loop approval queue for AI-generated fixes. HIGH=manual, MEDIUM=optional, LOW=auto-approve';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION (
+    VALIDATION_ID       VARCHAR(256)     NOT NULL DEFAULT UUID_STRING(),
+    EVENT_ID            VARCHAR(256)     NOT NULL,
+    FIX_SQL             VARCHAR(16777216),
+    TEST_QUERY          VARCHAR(16777216),
+    TEST_RESULT         VARCHAR(16777216),
+    VALIDATION_STATUS   VARCHAR(20)      NOT NULL DEFAULT 'PENDING',
+    VALIDATION_VERDICT  VARCHAR(50),
+    ORIGINAL_ERROR      VARCHAR(16777216),
+    ORIGINAL_QUERY      VARCHAR(16777216),
+    VALIDATED_AT        TIMESTAMP_LTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT PK_POST_FIX_VALIDATION PRIMARY KEY (VALIDATION_ID)
+)
+COMMENT = 'Post-fix validation results. Validates system health after AI-executed fixes.';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.AI_ENGINE.SLA_DEMO_BREACHES (
+    EVENT_ID              VARCHAR(256),
+    PIPELINE_TYPE         VARCHAR(50),
+    SOURCE_TYPE           VARCHAR(50),
+    EXECUTION_TIME_SECONDS FLOAT,
+    SLA_STATUS            VARCHAR(20),
+    BREACH_REASON         VARCHAR(200),
+    ERROR_CATEGORY        VARCHAR(50),
+    SEVERITY              VARCHAR(20),
+    START_TIME            TIMESTAMP_LTZ
+)
+COMMENT = 'Demo SLA breach data for testing P1 critical alerts and SLA views';
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE (
+    ID   NUMBER(38,0),
+    NAME VARCHAR(16777216)
+)
+COMMENT = 'Source table for Dynamic Table demo error generation';
+
+
+-- ============================================================================
+-- SECTION 3: KNOWLEDGE BASE + CONFIG
+-- ============================================================================
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.METADATA.ERROR_KB (
+    PATTERN         VARCHAR(500)     NOT NULL,
+    ROOT_CAUSE      VARCHAR(16777216) NOT NULL,
+    RECOMMENDED_FIX VARCHAR(16777216) NOT NULL,
+    FIX_SQL         VARCHAR(16777216),
+    CONSTRAINT PK_ERROR_KB PRIMARY KEY (PATTERN)
+)
+COMMENT = 'Knowledge base of common error patterns for AI-enriched failure analysis';
+
+
+INSERT INTO OPS_AI_MONITOR.METADATA.ERROR_KB
+    (PATTERN, ROOT_CAUSE, RECOMMENDED_FIX, FIX_SQL)
+VALUES
+    ('does not exist',
+     'Referenced object (table, view, schema, or database) is missing or has been dropped',
+     'Verify the object name and schema path. Restore from Time Travel if recently dropped.',
+     'UNDROP TABLE <database>.<schema>.<table>;'),
+
+
+    ('object not found',
+     'Object reference is invalid due to typo, wrong schema context, or the object was never created',
+     'Check spelling, confirm the active database/schema context, or create the missing object.',
+     'SHOW OBJECTS LIKE ''%<object_name>%'' IN DATABASE <database>;'),
+
+
+    ('permission denied',
+     'The executing role lacks the required privilege on the target object',
+     'Grant the necessary privilege to the role, or switch to a role that already has access.',
+     'GRANT SELECT ON TABLE <database>.<schema>.<table> TO ROLE <role>;'),
+
+
+    ('insufficient privileges',
+     'The executing role does not have USAGE on the database, schema, or warehouse, or lacks the required object-level privilege',
+     'Grant USAGE on the container objects and the specific privilege on the target object.',
+     'GRANT USAGE ON DATABASE <database> TO ROLE <role>; GRANT USAGE ON SCHEMA <database>.<schema> TO ROLE <role>;'),
+
+
+    ('division by zero',
+     'A numeric expression attempted to divide by zero at runtime',
+     'Add a NULLIF or IFF guard around the divisor to prevent division by zero.',
+     'SELECT numerator / NULLIF(denominator, 0) FROM <table>;'),
+
+
+    ('warehouse is suspended',
+     'The assigned warehouse is suspended and AUTO_RESUME is not enabled, or resume is in progress',
+     'Resume the warehouse manually or enable AUTO_RESUME.',
+     'ALTER WAREHOUSE <warehouse_name> RESUME; ALTER WAREHOUSE <warehouse_name> SET AUTO_RESUME = TRUE;'),
+
+
+    ('stale',
+     'Stream exceeded data retention period and can no longer track changes',
+     'Recreate the stream to reset its offset. Increase DATA_RETENTION_TIME_IN_DAYS on source table.',
+     'CREATE OR REPLACE STREAM <stream_name> ON TABLE <source_table>;'),
+
+
+    ('change tracking',
+     'Change tracking is not enabled or has expired for the source table used by a dynamic table or stream',
+     'Enable change tracking on the source table.',
+     'ALTER TABLE <table_name> SET CHANGE_TRACKING = TRUE;'),
+
+
+    ('upstream',
+     'A dynamic table refresh failed because an upstream dynamic table or source had errors',
+     'Fix the upstream dynamic table first. Check the DAG in Snowsight under Transformation > Dynamic Tables.',
+     'SELECT NAME, STATE, STATE_MESSAGE FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(ERROR_ONLY => TRUE));'),
+
+
+    ('load failed',
+     'Snowpipe or COPY INTO failed to load data from staged files due to format mismatch or corrupt data',
+     'Check the file format, field delimiter, and encoding. Validate staged files before loading.',
+     'SELECT * FROM TABLE(VALIDATE(<table>, JOB_ID => ''<job_id>''));'),
+
+
+    ('file format',
+     'The file format specified does not match the actual data layout in the staged file',
+     'Verify the file format definition matches the source file structure (CSV, JSON, Parquet, etc.).',
+     'DESC FILE FORMAT <file_format_name>;');
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.METADATA.ELT_WAREHOUSES (
+    WAREHOUSE_NAME VARCHAR(256) NOT NULL,
+    CONSTRAINT PK_ELT_WH PRIMARY KEY (WAREHOUSE_NAME)
+)
+COMMENT = 'Warehouses dedicated to ELT workloads for pipeline classification';
+
+
+INSERT INTO OPS_AI_MONITOR.METADATA.ELT_WAREHOUSES (WAREHOUSE_NAME)
+VALUES ('ETL_WH'), ('ELT_WH'), ('LOADING_WH'), ('TRANSFORM_WH'), ('DBT_WH');
+
+
+-- ============================================================================
+-- SECTION 4: VIEWS - DATA INGESTION
+-- ============================================================================
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.EVENT_LOGS.V_UNIFIED_FAILURES
+AS
+SELECT
+    QUERY_ID                                              AS EVENT_ID,
+    'QUERY_REALTIME'                                      AS SOURCE_TYPE,
+    ERROR_MESSAGE,
+    QUERY_TEXT,
+    USER_NAME,
+    WAREHOUSE_NAME                                        AS WAREHOUSE,
+    DATABASE_NAME                                         AS "DATABASE",
+    SCHEMA_NAME                                           AS "SCHEMA",
+    START_TIME
+FROM TABLE(
+    OPS_AI_MONITOR.INFORMATION_SCHEMA.QUERY_HISTORY(
+        END_TIME_RANGE_START => DATEADD('MINUTES', -10, CURRENT_TIMESTAMP()),
+        END_TIME_RANGE_END   => CURRENT_TIMESTAMP(),
+        RESULT_LIMIT         => 10000
+    )
+)
+WHERE EXECUTION_STATUS IN ('FAILED_WITH_ERROR', 'FAILED_WITH_INCIDENT')
+
+
+UNION ALL
+
+
+SELECT
+    COALESCE(
+        QUERY_ID,
+        NAME || '_' || TO_VARCHAR(SCHEDULED_TIME, 'YYYYMMDDHH24MISS')
+    )                                                     AS EVENT_ID,
+    'TASK'                                                AS SOURCE_TYPE,
+    ERROR_MESSAGE,
+    QUERY_TEXT,
+    NULL::VARCHAR                                         AS USER_NAME,
+    NULL::VARCHAR                                         AS WAREHOUSE,
+    DATABASE_NAME                                         AS "DATABASE",
+    SCHEMA_NAME                                           AS "SCHEMA",
+    COALESCE(QUERY_START_TIME, SCHEDULED_TIME)            AS START_TIME
+FROM TABLE(
+    SNOWFLAKE.INFORMATION_SCHEMA.TASK_HISTORY(
+        SCHEDULED_TIME_RANGE_START => DATEADD('MINUTES', -10, CURRENT_TIMESTAMP()),
+        SCHEDULED_TIME_RANGE_END   => CURRENT_TIMESTAMP(),
+        RESULT_LIMIT               => 10000,
+        ERROR_ONLY                 => TRUE
+    )
+)
+
+
+UNION ALL
+
+
+SELECT
+    QUERY_ID                                              AS EVENT_ID,
+    'QUERY_ACCOUNT_USAGE'                                 AS SOURCE_TYPE,
+    ERROR_MESSAGE,
+    QUERY_TEXT,
+    USER_NAME,
+    WAREHOUSE_NAME                                        AS WAREHOUSE,
+    DATABASE_NAME                                         AS "DATABASE",
+    SCHEMA_NAME                                           AS "SCHEMA",
+    START_TIME
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE EXECUTION_STATUS IN ('FAIL', 'INCIDENT')
+  AND START_TIME >= DATEADD('MINUTES', -10, CURRENT_TIMESTAMP())
+
+
+UNION ALL
+
+
+SELECT
+    COALESCE(QUERY_ID, NAME || '_DT_' || TO_VARCHAR(DATA_TIMESTAMP, 'YYYYMMDDHH24MISS'))
+                                                          AS EVENT_ID,
+    'DYNAMIC_TABLE'                                       AS SOURCE_TYPE,
+    STATE_MESSAGE                                         AS ERROR_MESSAGE,
+    QUALIFIED_NAME                                        AS QUERY_TEXT,
+    NULL::VARCHAR                                         AS USER_NAME,
+    WAREHOUSE                                             AS WAREHOUSE,
+    DATABASE_NAME                                         AS "DATABASE",
+    SCHEMA_NAME                                           AS "SCHEMA",
+    REFRESH_START_TIME                                    AS START_TIME
+FROM TABLE(
+    SNOWFLAKE.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(
+        ERROR_ONLY => TRUE
+    )
+)
+WHERE REFRESH_START_TIME >= DATEADD('MINUTES', -10, CURRENT_TIMESTAMP())
+
+
+UNION ALL
+
+
+SELECT
+    MD5(PIPE_NAME || FILE_NAME || TO_VARCHAR(LAST_LOAD_TIME))
+                                                          AS EVENT_ID,
+    'SNOWPIPE'                                            AS SOURCE_TYPE,
+    FIRST_ERROR_MESSAGE                                   AS ERROR_MESSAGE,
+    FILE_NAME                                             AS QUERY_TEXT,
+    NULL::VARCHAR                                         AS USER_NAME,
+    NULL::VARCHAR                                         AS WAREHOUSE,
+    TABLE_CATALOG_NAME                                    AS "DATABASE",
+    TABLE_SCHEMA_NAME                                     AS "SCHEMA",
+    LAST_LOAD_TIME                                        AS START_TIME
+FROM SNOWFLAKE.ACCOUNT_USAGE.COPY_HISTORY
+WHERE STATUS IN ('Load failed', 'Partially loaded')
+  AND LAST_LOAD_TIME >= DATEADD('HOURS', -2, CURRENT_TIMESTAMP())
+  AND PIPE_NAME IS NOT NULL
+
+
+UNION ALL
+
+
+SELECT
+    'STALE_STREAM_' || STREAM_NAME                        AS EVENT_ID,
+    'STREAM_STALE'                                        AS SOURCE_TYPE,
+    'Stream is stale: data retention period exceeded'     AS ERROR_MESSAGE,
+    STREAM_NAME                                           AS QUERY_TEXT,
+    NULL::VARCHAR                                         AS USER_NAME,
+    NULL::VARCHAR                                         AS WAREHOUSE,
+    DATABASE_NAME                                         AS "DATABASE",
+    SCHEMA_NAME                                           AS "SCHEMA",
+    DETECTED_AT                                           AS START_TIME
+FROM OPS_AI_MONITOR.EVENT_LOGS.STALE_STREAMS
+WHERE DETECTED_AT >= DATEADD('MINUTES', -10, CURRENT_TIMESTAMP())
+
+
+UNION ALL
+
+
+SELECT
+    EVENT_ID,
+    SOURCE_SYSTEM                                         AS SOURCE_TYPE,
+    ERROR_MESSAGE,
+    QUERY_TEXT,
+    USER_NAME,
+    WAREHOUSE_NAME                                        AS WAREHOUSE,
+    DATABASE_NAME                                         AS "DATABASE",
+    SCHEMA_NAME                                           AS "SCHEMA",
+    START_TIME
+FROM OPS_AI_MONITOR.EVENT_LOGS.CUSTOM_LOGS
+WHERE STATUS = 'FAILED'
+  AND CREATED_AT >= DATEADD('HOURS', -24, CURRENT_TIMESTAMP());
+
+
+-- ============================================================================
+-- SECTION 5: VIEWS - AI PROCESSING
+-- ============================================================================
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_AI_QUEUE
+AS
+SELECT
+    FE.EVENT_ID,
+    FE.ERROR_MESSAGE,
+    FE.QUERY_TEXT,
+    FE.START_TIME
+FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA
+    ON FE.EVENT_ID = EA.EVENT_ID
+WHERE EA.EVENT_ID IS NULL
+   OR (EA.STATUS = 'FAILED' AND EA.RETRY_COUNT < 3)
+ORDER BY FE.START_TIME DESC
+LIMIT 20;
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS
+AS
+SELECT
+    FE.EVENT_ID,
+    FE.ERROR_MESSAGE,
+    FE.QUERY_TEXT,
+    FE.START_TIME,
+    EA.ROOT_CAUSE,
+    EA.SEVERITY,
+    EA.SUGGESTED_FIX,
+    EA.FIX_SQL,
+    EA.CONFIDENCE_SCORE,
+    COALESCE(EA.STATUS, 'PENDING') AS STATUS
+FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA
+    ON FE.EVENT_ID = EA.EVENT_ID
+ORDER BY FE.START_TIME DESC;
+
+
+-- ============================================================================
+-- SECTION 6: VIEWS - CLASSIFICATION & ENRICHMENT
+-- ============================================================================
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED
+AS
+SELECT
+    FE.EVENT_ID,
+    FE.SOURCE_TYPE,
+    FE.ERROR_MESSAGE,
+    FE.QUERY_TEXT,
+    FE.USER_NAME,
+    FE.WAREHOUSE_NAME,
+    FE.DATABASE_NAME,
+    FE.SCHEMA_NAME,
+    FE.START_TIME,
+
+
+    CASE
+        WHEN FE.SOURCE_TYPE = 'FIVETRAN'         THEN 'FIVETRAN'
+        WHEN FE.SOURCE_TYPE = 'DBT'              THEN 'DBT'
+        WHEN FE.SOURCE_TYPE = 'CUSTOM'           THEN 'CUSTOM_ETL'
+        WHEN FE.SOURCE_TYPE = 'DYNAMIC_TABLE'    THEN 'DYNAMIC_TABLE'
+        WHEN FE.SOURCE_TYPE = 'SNOWPIPE'         THEN 'SNOWPIPE'
+        WHEN FE.SOURCE_TYPE IN ('TASK', 'TASK_REALTIME') THEN 'TASK'
+        WHEN FE.SOURCE_TYPE = 'STORED_PROC'      THEN 'STORED_PROC'
+        WHEN FE.SOURCE_TYPE ILIKE '%ELT%'        THEN 'ELT'
+        ELSE 'SQL'
+    END AS PIPELINE_TYPE,
+
+
+    COALESCE(
+        CL.PIPELINE_NAME,
+        REGEXP_SUBSTR(FE.QUERY_TEXT, 'dbt\\s+run\\s+--select\\s+(\\S+)', 1, 1, 'ie'),
+        REGEXP_SUBSTR(FE.QUERY_TEXT, 'TASK\\s+(\\S+)', 1, 1, 'ie'),
+        REGEXP_SUBSTR(FE.QUERY_TEXT, 'PROCEDURE\\s+(\\S+)', 1, 1, 'ie'),
+        REGEXP_SUBSTR(FE.QUERY_TEXT, 'CALL\\s+(\\S+)', 1, 1, 'ie'),
+        REGEXP_SUBSTR(FE.ERROR_MESSAGE, 'Task\\s+(\\S+)', 1, 1, 'ie'),
+        REGEXP_SUBSTR(FE.ERROR_MESSAGE, 'table\\s+''?([\\w\\.]+)''?', 1, 1, 'ie'),
+        REGEXP_SUBSTR(FE.ERROR_MESSAGE, 'Object\\s+''?([\\w\\.]+)''?', 1, 1, 'ie'),
+        CASE
+            WHEN FE.DATABASE_NAME IS NOT NULL AND FE.SCHEMA_NAME IS NOT NULL
+            THEN FE.DATABASE_NAME || '.' || FE.SCHEMA_NAME
+            ELSE LEFT(COALESCE(FE.QUERY_TEXT, 'Unknown'), 50)
+        END
+    ) AS PIPELINE_NAME,
+
+
+    CASE
+        WHEN FE.ERROR_MESSAGE ILIKE '%does not exist%' OR FE.ERROR_MESSAGE ILIKE '%not found%' THEN 'MISSING_OBJECT'
+        WHEN FE.ERROR_MESSAGE ILIKE '%not authorized%' OR FE.ERROR_MESSAGE ILIKE '%insufficient privileges%' THEN 'PERMISSION'
+        WHEN FE.ERROR_MESSAGE ILIKE '%syntax error%' OR FE.ERROR_MESSAGE ILIKE '%compilation error%' THEN 'SYNTAX'
+        WHEN FE.ERROR_MESSAGE ILIKE '%division by zero%' THEN 'RUNTIME'
+        WHEN FE.ERROR_MESSAGE ILIKE '%stale%' THEN 'STALENESS'
+        WHEN FE.ERROR_MESSAGE ILIKE '%file format%' OR FE.ERROR_MESSAGE ILIKE '%copy into%' THEN 'DATA_LOAD'
+        WHEN FE.ERROR_MESSAGE ILIKE '%connection%' OR FE.ERROR_MESSAGE ILIKE '%timeout%' OR FE.ERROR_MESSAGE ILIKE '%rate limit%' THEN 'CONNECTIVITY'
+        WHEN FE.ERROR_MESSAGE ILIKE '%type mismatch%' OR FE.ERROR_MESSAGE ILIKE '%numeric%' OR FE.ERROR_MESSAGE ILIKE '%cast%' THEN 'DATA_TYPE'
+        ELSE 'OTHER'
+    END AS ERROR_CATEGORY,
+
+
+    EA.ROOT_CAUSE,
+    COALESCE(EA.SEVERITY, 'MEDIUM') AS SEVERITY,
+    EA.SUGGESTED_FIX,
+    EA.FIX_SQL,
+    EA.TEST_SQL,
+    EA.CONFIDENCE_SCORE,
+
+
+    CASE
+        WHEN EA.STATUS IS NULL THEN 'PENDING'
+        WHEN EA.STATUS = 'SUCCESS' THEN 'ANALYZED'
+        WHEN EA.STATUS = 'FAILED' THEN 'ANALYSIS_FAILED'
+        ELSE EA.STATUS
+    END AS AI_STATUS,
+
+
+    FAQ.APPROVAL_STATUS AS FIX_STATUS,
+    AFL.EXECUTION_STATUS AS FIX_EXECUTION,
+    EA.STATUS AS _RAW_AI_STATUS
+
+
+FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA ON FE.EVENT_ID = EA.EVENT_ID
+LEFT JOIN OPS_AI_MONITOR.EVENT_LOGS.CUSTOM_LOGS CL ON FE.EVENT_ID = CL.EVENT_ID
+LEFT JOIN (
+    SELECT EVENT_ID, APPROVAL_STATUS,
+           ROW_NUMBER() OVER (PARTITION BY EVENT_ID ORDER BY CREATED_AT DESC) AS RN
+    FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+) FAQ ON FE.EVENT_ID = FAQ.EVENT_ID AND FAQ.RN = 1
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS AFL ON FE.EVENT_ID = AFL.EVENT_ID
+ORDER BY FE.START_TIME DESC;
+
+
+-- ============================================================================
+-- SECTION 7: VIEWS - OBSERVABILITY & ALERTING
+-- ============================================================================
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_METRICS
+AS
+SELECT
+    COUNT(*)                                                              AS TOTAL_FAILURES,
+    COUNT_IF(FE.SOURCE_TYPE IN ('QUERY_REALTIME', 'QUERY_ACCOUNT_USAGE')) AS QUERY_FAILURES,
+    COUNT_IF(FE.SOURCE_TYPE = 'TASK')                                     AS TASK_FAILURES,
+    COUNT_IF(FE.SOURCE_TYPE = 'DYNAMIC_TABLE')                            AS DYNAMIC_TABLE_FAILURES,
+    COUNT_IF(FE.SOURCE_TYPE = 'SNOWPIPE')                                 AS SNOWPIPE_FAILURES,
+    COUNT_IF(FE.SOURCE_TYPE = 'STREAM_STALE')                             AS STREAM_FAILURES,
+    COUNT_IF(FE.SOURCE_TYPE IN ('FIVETRAN', 'DBT', 'CUSTOM'))            AS EXTERNAL_FAILURES,
+    COUNT_IF(FE.ERROR_MESSAGE ILIKE '%does not exist%'
+          OR FE.ERROR_MESSAGE ILIKE '%not authorized%')                   AS MISSING_OBJECT_COUNT,
+    COUNT_IF(EA.SEVERITY = 'HIGH')                                        AS HIGH_SEVERITY_COUNT,
+    COUNT_IF(EA.SEVERITY = 'MEDIUM')                                      AS MEDIUM_SEVERITY_COUNT,
+    COUNT_IF(EA.SEVERITY = 'LOW')                                         AS LOW_SEVERITY_COUNT,
+    COUNT_IF(EA.STATUS = 'SUCCESS')                                       AS AI_SUCCESS_COUNT,
+    COUNT_IF(EA.STATUS = 'FAILED')                                        AS AI_FAILED_COUNT,
+    COUNT_IF(EA.EVENT_ID IS NULL)                                         AS AI_PENDING_COUNT,
+    ROUND(COUNT_IF(EA.STATUS = 'SUCCESS') * 100.0 / NULLIF(COUNT(*), 0), 1) AS AI_SUCCESS_RATE_PCT,
+    MIN(FE.START_TIME)                                                    AS EARLIEST_FAILURE,
+    MAX(FE.START_TIME)                                                    AS LATEST_FAILURE
+FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA
+    ON FE.EVENT_ID = EA.EVENT_ID
+WHERE FE.START_TIME >= DATEADD('DAY', -1, CURRENT_TIMESTAMP());
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_SLA_BREACH
+AS
+SELECT
+    FE.EVENT_ID,
+    VE.PIPELINE_TYPE,
+    FE.SOURCE_TYPE,
+    ROUND(QH.TOTAL_ELAPSED_TIME / 1000, 1)               AS EXECUTION_TIME_SECONDS,
+    CASE
+        WHEN QH.TOTAL_ELAPSED_TIME / 1000 > 300 THEN 'BREACHED'
+        ELSE 'OK'
+    END                                                    AS SLA_STATUS,
+    CASE
+        WHEN QH.TOTAL_ELAPSED_TIME / 1000 > 600 THEN 'CRITICAL: exceeded 2x SLA (>10 min)'
+        WHEN QH.TOTAL_ELAPSED_TIME / 1000 > 300 THEN 'WARNING: exceeded SLA threshold (>5 min)'
+        ELSE 'Within SLA'
+    END                                                    AS BREACH_REASON,
+    VE.ERROR_CATEGORY,
+    VE.SEVERITY,
+    FE.START_TIME
+FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+INNER JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY QH
+    ON FE.EVENT_ID = QH.QUERY_ID
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED VE
+    ON FE.EVENT_ID = VE.EVENT_ID
+WHERE FE.START_TIME >= DATEADD('DAY', -1, CURRENT_TIMESTAMP())
+ORDER BY EXECUTION_TIME_SECONDS DESC
+UNION ALL
+SELECT EVENT_ID, PIPELINE_TYPE, SOURCE_TYPE, EXECUTION_TIME_SECONDS,
+       SLA_STATUS, BREACH_REASON, ERROR_CATEGORY, SEVERITY, START_TIME
+FROM OPS_AI_MONITOR.AI_ENGINE.SLA_DEMO_BREACHES;
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_SLA_SUMMARY
+AS
+SELECT
+    PIPELINE_TYPE,
+    COUNT(*)                                                             AS TOTAL_RUNS,
+    COUNT_IF(SLA_STATUS = 'BREACHED')                                    AS BREACHED_RUNS,
+    ROUND((COUNT(*) - COUNT_IF(SLA_STATUS = 'BREACHED')) * 100.0
+          / NULLIF(COUNT(*), 0), 1)                                      AS SUCCESS_RATE_PCT,
+    ROUND(AVG(EXECUTION_TIME_SECONDS), 2)                                AS AVG_EXECUTION_TIME_SEC,
+    ROUND(MAX(EXECUTION_TIME_SECONDS), 2)                                AS MAX_EXECUTION_TIME_SEC,
+    ROUND(MEDIAN(EXECUTION_TIME_SECONDS), 2)                             AS P50_EXECUTION_TIME_SEC
+FROM OPS_AI_MONITOR.AI_ENGINE.V_SLA_BREACH
+GROUP BY PIPELINE_TYPE
+ORDER BY BREACHED_RUNS DESC, TOTAL_RUNS DESC;
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_CRITICAL_ALERTS
+AS
+WITH REPEAT_OFFENDERS AS (
+    SELECT
+        EVENT_ID,
+        ERROR_MESSAGE,
+        COUNT(*) OVER (
+            PARTITION BY ERROR_MESSAGE
+            ORDER BY START_TIME
+            RANGE BETWEEN INTERVAL '10 MINUTES' PRECEDING AND CURRENT ROW
+        ) AS FAILURES_IN_WINDOW
+    FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS
+    WHERE START_TIME >= DATEADD('DAY', -1, CURRENT_TIMESTAMP())
+),
+SLA AS (
+    SELECT EVENT_ID, SLA_STATUS
+    FROM OPS_AI_MONITOR.AI_ENGINE.V_SLA_BREACH
+    WHERE SLA_STATUS = 'BREACHED'
+)
+SELECT
+    FE.EVENT_ID,
+    VE.PIPELINE_TYPE,
+    VE.ERROR_CATEGORY,
+    VE.SEVERITY,
+    CASE
+        WHEN VE.SEVERITY = 'HIGH' AND SLA.EVENT_ID IS NOT NULL AND RO.FAILURES_IN_WINDOW > 3
+            THEN 'HIGH_SEV + SLA_BREACH + REPEATED'
+        WHEN VE.SEVERITY = 'HIGH' AND SLA.EVENT_ID IS NOT NULL
+            THEN 'HIGH_SEV + SLA_BREACH'
+        WHEN VE.SEVERITY = 'HIGH' AND RO.FAILURES_IN_WINDOW > 3
+            THEN 'HIGH_SEV + REPEATED'
+        WHEN SLA.EVENT_ID IS NOT NULL AND RO.FAILURES_IN_WINDOW > 3
+            THEN 'SLA_BREACH + REPEATED'
+        WHEN VE.SEVERITY = 'HIGH'
+            THEN 'HIGH_SEVERITY'
+        WHEN SLA.EVENT_ID IS NOT NULL
+            THEN 'SLA_BREACH'
+        WHEN RO.FAILURES_IN_WINDOW > 3
+            THEN 'REPEATED_FAILURE'
+    END AS ISSUE_TYPE,
+    CASE
+        WHEN VE.SEVERITY = 'HIGH' AND SLA.EVENT_ID IS NOT NULL  THEN 'P1'
+        WHEN VE.SEVERITY = 'HIGH' OR SLA.EVENT_ID IS NOT NULL   THEN 'P2'
+        WHEN RO.FAILURES_IN_WINDOW > 3                          THEN 'P3'
+    END AS ALERT_FLAG,
+    RO.FAILURES_IN_WINDOW,
+    FE.ERROR_MESSAGE,
+    FE.START_TIME
+FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+JOIN OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED VE
+    ON FE.EVENT_ID = VE.EVENT_ID
+LEFT JOIN SLA
+    ON FE.EVENT_ID = SLA.EVENT_ID
+LEFT JOIN REPEAT_OFFENDERS RO
+    ON FE.EVENT_ID = RO.EVENT_ID
+WHERE FE.START_TIME >= DATEADD('DAY', -1, CURRENT_TIMESTAMP())
+  AND (VE.SEVERITY = 'HIGH'
+       OR SLA.EVENT_ID IS NOT NULL
+       OR RO.FAILURES_IN_WINDOW > 3)
+ORDER BY
+    CASE ALERT_FLAG WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 END,
+    FE.START_TIME DESC;
+
+
+-- ============================================================================
+-- SECTION 8: TASKS (DAG)
+-- ============================================================================
+
+
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_INGEST_FAILURES
+    WAREHOUSE = OPS_MONITOR_WH
+    SCHEDULE  = '1 MINUTE'
+    SUSPEND_TASK_AFTER_NUM_FAILURES = 5
+    TASK_AUTO_RETRY_ATTEMPTS = 1
+    COMMENT   = 'Merges new failure events from unified view into persisted table every 1 minute'
+AS
+    MERGE INTO OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS AS TGT
+    USING (
+        SELECT
+            EVENT_ID,
+            SOURCE_TYPE,
+            ERROR_MESSAGE,
+            QUERY_TEXT,
+            USER_NAME,
+            WAREHOUSE        AS WAREHOUSE_NAME,
+            "DATABASE"       AS DATABASE_NAME,
+            "SCHEMA"         AS SCHEMA_NAME,
+            START_TIME
+        FROM OPS_AI_MONITOR.EVENT_LOGS.V_UNIFIED_FAILURES
+    ) AS SRC
+        ON  TGT.EVENT_ID    = SRC.EVENT_ID
+        AND TGT.SOURCE_TYPE = SRC.SOURCE_TYPE
+    WHEN NOT MATCHED THEN INSERT (
+        EVENT_ID, SOURCE_TYPE, ERROR_MESSAGE, QUERY_TEXT,
+        USER_NAME, WAREHOUSE_NAME, DATABASE_NAME, SCHEMA_NAME,
+        START_TIME
+    )
+    VALUES (
+        SRC.EVENT_ID, SRC.SOURCE_TYPE, SRC.ERROR_MESSAGE, SRC.QUERY_TEXT,
+        SRC.USER_NAME, SRC.WAREHOUSE_NAME, SRC.DATABASE_NAME, SRC.SCHEMA_NAME,
+        SRC.START_TIME
+    );
+
+
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_AI_ANALYZE
+    WAREHOUSE = OPS_MONITOR_WH
+    COMMENT = 'Runs KB-enriched Cortex COMPLETE on queued failures via V_AI_QUEUE, 10 per run. fix_sql is ALWAYS guaranteed.'
+    AFTER OPS_AI_MONITOR.EVENT_LOGS.TSK_INGEST_FAILURES
+AS
+    MERGE INTO OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS AS TGT
+    USING (
+        WITH QUEUED AS (
+            SELECT EVENT_ID, ERROR_MESSAGE, QUERY_TEXT
+            FROM OPS_AI_MONITOR.AI_ENGINE.V_AI_QUEUE
+            LIMIT 10
+        ),
+        KB_ENRICHED AS (
+            SELECT
+                Q.EVENT_ID,
+                Q.ERROR_MESSAGE,
+                Q.QUERY_TEXT,
+                KB.RECOMMENDED_FIX AS KB_HINT,
+                KB.FIX_SQL         AS KB_FIX_SQL
+            FROM QUEUED Q
+            LEFT JOIN OPS_AI_MONITOR.METADATA.ERROR_KB KB
+                ON Q.ERROR_MESSAGE ILIKE '%' || KB.PATTERN || '%'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY Q.EVENT_ID
+                ORDER BY LENGTH(KB.PATTERN) DESC NULLS LAST
+            ) = 1
+        ),
+        AI_RAW AS (
+            SELECT
+                EVENT_ID,
+                ERROR_MESSAGE,
+                QUERY_TEXT,
+                SNOWFLAKE.CORTEX.COMPLETE(
+                    'mistral-large2',
+                    CONCAT(
+                        'You are a Snowflake SQL expert analyzing pipeline failures.\n',
+                        'Determine root cause, provide an actionable fix, AND a validation test query.\n\n',
+                        'CRITICAL RULES:\n',
+                        '- fix_sql MUST ALWAYS contain executable Snowflake SQL. NEVER return null or empty fix_sql.\n',
+                        '- test_sql MUST ALWAYS contain a safe read-only SELECT query to validate the fix worked.\n\n',
+                        'If you know the exact fix, provide it.\n',
+                        'If you are unsure, generate a SAFE diagnostic SQL instead using these rules:\n',
+                        '- Missing table/object → SHOW TABLES LIKE ''<object_name>'' IN ACCOUNT\n',
+                        '- Permission/privilege error → SHOW GRANTS ON <object_type> <object_name>\n',
+                        '- Syntax/compilation error → SELECT ''SYNTAX_ERROR'' AS issue, ''<brief_description>'' AS detail\n',
+                        '- Data type/cast error → SELECT TRY_CAST(''<value>'' AS <target_type>) AS diagnostic\n',
+                        '- Division by zero → SELECT ''DIVISION_BY_ZERO'' AS issue, ''Add NULLIF guard'' AS fix\n',
+                        '- Stale stream → SHOW STREAMS LIKE ''<stream_name>'' IN ACCOUNT\n',
+                        '- Load/file format error → SHOW STAGES LIKE ''<stage_name>'' IN ACCOUNT\n',
+                        '- Warehouse issue → SHOW WAREHOUSES LIKE ''<warehouse_name>''\n',
+                        '- Unknown/other → SELECT ''<first_100_chars_of_error>'' AS debug_info\n\n',
+                        'FORBIDDEN in fix_sql: DROP, DELETE, TRUNCATE, CREATE OR REPLACE. These are dangerous.\n',
+                        'FORBIDDEN in test_sql: Any DML/DDL (INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, GRANT, MERGE).\n\n',
+                        'test_sql RULES (for validating the fix):\n',
+                        '- MUST be a safe read-only SELECT. No DML/DDL.\n',
+                        '- Missing table fix → SELECT COUNT(*) FROM <table_name>\n',
+                        '- Permission fix → SELECT CURRENT_ROLE() AS role_check\n',
+                        '- Syntax fix → Re-run the corrected query (SELECT only)\n',
+                        '- Object creation fix → SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = ''<name>''\n',
+                        '- Data type fix → SELECT TRY_CAST(''<value>'' AS <type>) AS cast_check\n',
+                        '- If unsure → SELECT 1 AS VALIDATION_OK\n\n',
+                        'Common failure categories: missing object, insufficient privileges, ',
+                        'SQL syntax error, division by zero, data type mismatch, resource contention, ',
+                        'stale stream, load failure, schema drift, connectivity.\n\n',
+                        'ERROR: ', COALESCE(LEFT(ERROR_MESSAGE, 1000), 'N/A'), '\n\n',
+                        'QUERY: ', COALESCE(LEFT(QUERY_TEXT, 2000), 'N/A'), '\n\n',
+                        IFF(KB_HINT IS NOT NULL,
+                            CONCAT('Hint from knowledge base: ', KB_HINT, '\n',
+                                   'Reference fix: ', COALESCE(KB_FIX_SQL, 'N/A'), '\n\n'),
+                            ''),
+                        'Return ONLY a valid JSON object with these exact keys:\n',
+                        '{"root_cause":"...","severity":"LOW|MEDIUM|HIGH",',
+                        '"suggested_fix":"...","fix_sql":"<MUST BE EXECUTABLE SQL>",',
+                        '"test_sql":"<SAFE SELECT TO VALIDATE FIX>","confidence_score":0.0}\n\n',
+                        'Rules:\n',
+                        '- fix_sql MUST be present and contain valid executable Snowflake SQL. NEVER empty. NEVER null.\n',
+                        '- test_sql MUST be present and contain a safe SELECT query. NEVER empty. NEVER null.\n',
+                        '- fix_sql must NOT contain DROP, DELETE, TRUNCATE, or CREATE OR REPLACE.\n',
+                        '- test_sql must be read-only SELECT only.\n',
+                        '- confidence_score between 0.0 and 1.0\n',
+                        '- No markdown. No explanation. JSON only.'
+                    )
+                ) AS RAW_RESPONSE
+            FROM KB_ENRICHED
+        ),
+        AI_PARSED AS (
+            SELECT
+                EVENT_ID,
+                ERROR_MESSAGE,
+                QUERY_TEXT,
+                RAW_RESPONSE,
+                TRY_PARSE_JSON(
+                    TRIM(REGEXP_REPLACE(RAW_RESPONSE, '```[a-zA-Z]*|```', ''))
+                ) AS PARSED
+            FROM AI_RAW
+        ),
+        AI_VALIDATED AS (
+            SELECT
+                EVENT_ID,
+                ERROR_MESSAGE,
+                QUERY_TEXT,
+                RAW_RESPONSE,
+                PARSED,
+                PARSED:root_cause::VARCHAR       AS RAW_ROOT_CAUSE,
+                PARSED:severity::VARCHAR         AS RAW_SEVERITY,
+                PARSED:suggested_fix::VARCHAR    AS RAW_SUGGESTED_FIX,
+                PARSED:fix_sql::VARCHAR          AS RAW_FIX_SQL,
+                PARSED:test_sql::VARCHAR         AS RAW_TEST_SQL,
+                PARSED:confidence_score::FLOAT   AS RAW_CONFIDENCE
+            FROM AI_PARSED
+        ),
+        AI_SAFE AS (
+            SELECT
+                EVENT_ID,
+                RAW_RESPONSE,
+                PARSED,
+                COALESCE(RAW_ROOT_CAUSE, 'Unable to determine root cause') AS ROOT_CAUSE,
+                COALESCE(RAW_SEVERITY, 'MEDIUM')                           AS SEVERITY,
+                COALESCE(RAW_SUGGESTED_FIX, 'Review error details and investigate manually') AS SUGGESTED_FIX,
+                COALESCE(RAW_CONFIDENCE, 0.3)                              AS CONFIDENCE_SCORE,
+                CASE
+                    WHEN RAW_FIX_SQL IS NOT NULL
+                         AND TRIM(RAW_FIX_SQL) != ''
+                         AND UPPER(RAW_FIX_SQL) NOT LIKE '%DROP %'
+                         AND UPPER(RAW_FIX_SQL) NOT LIKE '%DELETE %'
+                         AND UPPER(RAW_FIX_SQL) NOT LIKE '%TRUNCATE %'
+                         AND UPPER(RAW_FIX_SQL) NOT LIKE '%CREATE OR REPLACE %'
+                        THEN RAW_FIX_SQL
+                    WHEN ERROR_MESSAGE ILIKE '%does not exist%'
+                      OR ERROR_MESSAGE ILIKE '%object%not found%'
+                      OR ERROR_MESSAGE ILIKE '%unknown%table%'
+                        THEN CONCAT('SHOW TABLES LIKE ''%',
+                             COALESCE(
+                                 REGEXP_SUBSTR(ERROR_MESSAGE, '''([^'']+)''', 1, 1, 'e'),
+                                 'UNKNOWN'
+                             ), '%'' IN ACCOUNT')
+                    WHEN ERROR_MESSAGE ILIKE '%insufficient privileges%'
+                      OR ERROR_MESSAGE ILIKE '%access denied%'
+                      OR ERROR_MESSAGE ILIKE '%permission%denied%'
+                      OR ERROR_MESSAGE ILIKE '%not authorized%'
+                        THEN 'SHOW GRANTS TO ROLE ' || CURRENT_ROLE()
+                    WHEN ERROR_MESSAGE ILIKE '%SQL compilation error%'
+                      OR ERROR_MESSAGE ILIKE '%syntax error%'
+                      OR ERROR_MESSAGE ILIKE '%parse error%'
+                        THEN CONCAT('SELECT ''SYNTAX_ERROR'' AS issue, ',
+                             '''', REPLACE(LEFT(COALESCE(ERROR_MESSAGE, 'Unknown syntax error'), 200), '''', '\\'''), ''' AS error_detail')
+                    WHEN ERROR_MESSAGE ILIKE '%division by zero%'
+                        THEN 'SELECT ''DIVISION_BY_ZERO'' AS issue, ''Wrap divisor with NULLIF(col, 0)'' AS suggested_fix'
+                    WHEN ERROR_MESSAGE ILIKE '%stale%'
+                      OR ERROR_MESSAGE ILIKE '%retention%'
+                        THEN CONCAT('SHOW STREAMS LIKE ''%',
+                             COALESCE(
+                                 REGEXP_SUBSTR(ERROR_MESSAGE, '''([^'']+)''', 1, 1, 'e'),
+                                 REGEXP_SUBSTR(QUERY_TEXT, '''([^'']+)''', 1, 1, 'e')
+                             ), '%'' IN ACCOUNT')
+                    WHEN ERROR_MESSAGE ILIKE '%load failed%'
+                      OR ERROR_MESSAGE ILIKE '%file format%'
+                      OR ERROR_MESSAGE ILIKE '%field delimiter%'
+                        THEN 'SHOW STAGES IN ACCOUNT'
+                    WHEN ERROR_MESSAGE ILIKE '%warehouse%'
+                        THEN 'SHOW WAREHOUSES'
+                    WHEN ERROR_MESSAGE ILIKE '%numeric value%'
+                      OR ERROR_MESSAGE ILIKE '%out of range%'
+                      OR ERROR_MESSAGE ILIKE '%type mismatch%'
+                        THEN CONCAT('SELECT ''DATA_TYPE_ERROR'' AS issue, ',
+                             '''', REPLACE(LEFT(COALESCE(ERROR_MESSAGE, 'Unknown type error'), 200), '''', '\\'''), ''' AS error_detail')
+                    WHEN ERROR_MESSAGE ILIKE '%connection%'
+                      OR ERROR_MESSAGE ILIKE '%SSL%'
+                      OR ERROR_MESSAGE ILIKE '%rate limit%'
+                      OR ERROR_MESSAGE ILIKE '%HTTP 429%'
+                        THEN CONCAT('SELECT ''CONNECTIVITY_ERROR'' AS issue, ',
+                             '''', REPLACE(LEFT(COALESCE(ERROR_MESSAGE, 'Unknown connectivity error'), 200), '''', '\\'''), ''' AS error_detail')
+                    ELSE CONCAT('SELECT ',
+                         '''', REPLACE(LEFT(COALESCE(ERROR_MESSAGE, 'Unknown error'), 200), '''', '\\'''), ''' AS debug_info')
+                END AS FIX_SQL,
+                CASE
+                    WHEN RAW_TEST_SQL IS NOT NULL
+                         AND TRIM(RAW_TEST_SQL) != ''
+                         AND UPPER(LEFT(TRIM(RAW_TEST_SQL), 6)) = 'SELECT'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%DROP %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%DELETE %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%INSERT %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%UPDATE %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%MERGE %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%CREATE %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%ALTER %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%GRANT %'
+                         AND UPPER(RAW_TEST_SQL) NOT LIKE '%TRUNCATE %'
+                        THEN RAW_TEST_SQL
+                    ELSE 'SELECT 1 AS VALIDATION_OK'
+                END AS TEST_SQL
+            FROM AI_VALIDATED
+        )
+        SELECT
+            EVENT_ID,
+            ROOT_CAUSE,
+            SEVERITY,
+            SUGGESTED_FIX,
+            FIX_SQL,
+            TEST_SQL,
+            CONFIDENCE_SCORE,
+            COALESCE(PARSED, OBJECT_CONSTRUCT(
+                'error', 'PARSE_FAILED',
+                'raw', RAW_RESPONSE
+            ))                                        AS RESPONSE_VARIANT,
+            IFF(PARSED IS NOT NULL, 'SUCCESS', 'FAILED') AS STATUS
+        FROM AI_SAFE
+    ) AS SRC
+    ON TGT.EVENT_ID = SRC.EVENT_ID
+    WHEN MATCHED THEN UPDATE SET
+        TGT.ROOT_CAUSE       = SRC.ROOT_CAUSE,
+        TGT.SEVERITY         = SRC.SEVERITY,
+        TGT.SUGGESTED_FIX    = SRC.SUGGESTED_FIX,
+        TGT.FIX_SQL          = SRC.FIX_SQL,
+        TGT.TEST_SQL         = SRC.TEST_SQL,
+        TGT.CONFIDENCE_SCORE = SRC.CONFIDENCE_SCORE,
+        TGT.RAW_RESPONSE     = SRC.RESPONSE_VARIANT,
+        TGT.STATUS           = SRC.STATUS,
+        TGT.RETRY_COUNT      = TGT.RETRY_COUNT + 1,
+        TGT.UPDATED_AT       = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN INSERT (
+        EVENT_ID, ROOT_CAUSE, SEVERITY, SUGGESTED_FIX, FIX_SQL, TEST_SQL,
+        CONFIDENCE_SCORE, RAW_RESPONSE, STATUS
+    )
+    VALUES (
+        SRC.EVENT_ID, SRC.ROOT_CAUSE, SRC.SEVERITY, SRC.SUGGESTED_FIX, SRC.FIX_SQL, SRC.TEST_SQL,
+        SRC.CONFIDENCE_SCORE, SRC.RESPONSE_VARIANT, SRC.STATUS
+    );
+
+
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_SEND_ALERTS
+    WAREHOUSE = OPS_MONITOR_WH
+    COMMENT = 'Sends email + Slack alerts for HIGH severity failures with approval workflow instructions'
+    AFTER OPS_AI_MONITOR.EVENT_LOGS.TSK_AI_ANALYZE
+AS
+DECLARE
+    ALERT_COUNT   INT;
+    PENDING_COUNT INT;
+    ALERT_BODY    VARCHAR;
+    SLACK_BLOCKS  VARCHAR;
+    ALERT_DETAIL  VARCHAR;
+    RECENT_ALERTS INT;
+BEGIN
+    SELECT COUNT(*) INTO :RECENT_ALERTS
+    FROM OPS_AI_MONITOR.AI_ENGINE.ALERT_LOG
+    WHERE ALERTED_AT >= DATEADD('MINUTE', -5, CURRENT_TIMESTAMP());
+
+
+    IF (:RECENT_ALERTS >= 10) THEN
+        RETURN 'Cooldown: ' || :RECENT_ALERTS || ' alerts sent in last 5 min, skipping';
+    END IF;
+
+
+    CREATE OR REPLACE TEMPORARY TABLE OPS_AI_MONITOR.EVENT_LOGS.TMP_NEW_ALERTS AS
+    SELECT
+        CA.EVENT_ID, CA.ALERT_FLAG, CA.ISSUE_TYPE, CA.PIPELINE_TYPE, CA.SEVERITY,
+        LEFT(CA.ERROR_MESSAGE, 300) AS ERROR_SNIPPET,
+        COALESCE(EA.ROOT_CAUSE, 'Analysis pending') AS ROOT_CAUSE,
+        COALESCE(EA.SUGGESTED_FIX, 'No fix available yet') AS SUGGESTED_FIX,
+        COALESCE(EA.FIX_SQL, 'N/A') AS FIX_SQL,
+        COALESCE(EA.CONFIDENCE_SCORE, 0) AS CONFIDENCE_SCORE,
+        CA.START_TIME,
+        FAQ.APPROVAL_STATUS AS FIX_APPROVAL_STATUS,
+        FAQ.APPROVAL_POLICY AS FIX_POLICY,
+        COALESCE(VE.PIPELINE_NAME, CA.PIPELINE_TYPE) AS PIPELINE_NAME
+    FROM OPS_AI_MONITOR.AI_ENGINE.V_CRITICAL_ALERTS CA
+    LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA ON CA.EVENT_ID = EA.EVENT_ID
+    LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ALERT_LOG AL ON CA.EVENT_ID = AL.EVENT_ID
+    LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE FAQ ON CA.EVENT_ID = FAQ.EVENT_ID
+    LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED VE ON CA.EVENT_ID = VE.EVENT_ID
+    WHERE AL.EVENT_ID IS NULL AND CA.SEVERITY = 'HIGH' AND CA.ALERT_FLAG IN ('P1', 'P2')
+    ORDER BY CA.ALERT_FLAG, CA.START_TIME DESC
+    LIMIT 5;
+
+
+    SELECT COUNT(*) INTO :ALERT_COUNT FROM OPS_AI_MONITOR.EVENT_LOGS.TMP_NEW_ALERTS;
+    SELECT COUNT(*) INTO :PENDING_COUNT FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE WHERE APPROVAL_STATUS = 'PENDING';
+
+
+    IF (:ALERT_COUNT > 0) THEN
+
+
+        -- === EMAIL with pipeline name + type + approval workflow ===
+        SELECT CONCAT(
+            '<html><body style="font-family:Arial,sans-serif;background:#f4f4f4;padding:20px;">',
+            '<div style="max-width:700px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">',
+            '<div style="background:#d32f2f;color:#fff;padding:20px 24px;">',
+            '<h2 style="margin:0;">&#9888; CoCo Pipeline Alert</h2>',
+            '<p style="margin:4px 0 0;">', :ALERT_COUNT, ' new HIGH severity failure(s) | ',
+            :PENDING_COUNT, ' fix(es) awaiting approval</p>',
+            '</div>',
+            '<div style="background:#fff3e0;padding:12px 24px;border-bottom:1px solid #ffe0b2;">',
+            '<strong style="color:#e65100;">&#128227; Action Required:</strong> ',
+            'Fixes will NOT execute until approved. ',
+            '<a href="https://app.snowflake.com/gqb30339/#/streamlit-apps/a753tuigfbe34dmmok3r" ',
+            'style="color:#1565c0;font-weight:bold;">Open Dashboard &rarr; Fix Approvals tab</a>',
+            '</div>',
+            '<div style="padding:20px 24px;">',
+            LISTAGG(
+                CONCAT(
+                    '<div style="border:1px solid #e0e0e0;border-radius:6px;padding:16px;margin-bottom:16px;background:#fafafa;">',
+                    '<div style="display:flex;justify-content:space-between;margin-bottom:8px;">',
+                    '<span style="background:', CASE WHEN ALERT_FLAG = 'P1' THEN '#d32f2f' ELSE '#f57c00' END,
+                        ';color:#fff;padding:2px 10px;border-radius:12px;font-weight:bold;font-size:13px;">', ALERT_FLAG, '</span>',
+                    '<span style="padding:2px 10px;border-radius:12px;font-size:12px;font-weight:bold;background:',
+                        CASE WHEN FIX_APPROVAL_STATUS = 'PENDING' THEN '#fff3e0;color:#e65100'
+                             WHEN FIX_APPROVAL_STATUS IN ('APPROVED','AUTO_APPROVED') THEN '#e8f5e9;color:#2e7d32'
+                             ELSE '#f5f5f5;color:#666' END,
+                        ';">', COALESCE(FIX_APPROVAL_STATUS, 'NOT QUEUED'), '</span>',
+                    '</div>',
+                    '<table style="width:100%;border-collapse:collapse;font-size:14px;">',
+                    '<tr><td style="padding:4px 8px;color:#666;width:120px;"><strong>Pipeline</strong></td><td><strong>', PIPELINE_NAME, '</strong> (', PIPELINE_TYPE, ')</td></tr>',
+                    '<tr><td style="padding:4px 8px;color:#666;"><strong>Severity</strong></td><td style="color:#d32f2f;font-weight:bold;">', SEVERITY, '</td></tr>',
+                    '<tr><td style="padding:4px 8px;color:#666;vertical-align:top;"><strong>Error</strong></td><td>', ERROR_SNIPPET, '</td></tr>',
+                    '<tr><td style="padding:4px 8px;color:#666;vertical-align:top;"><strong>Root Cause</strong></td><td style="color:#1565c0;">', ROOT_CAUSE, '</td></tr>',
+                    '<tr><td style="padding:4px 8px;color:#666;vertical-align:top;"><strong>Fix</strong></td><td style="color:#2e7d32;">', SUGGESTED_FIX, '</td></tr>',
+                    '<tr><td style="padding:4px 8px;color:#666;vertical-align:top;"><strong>Fix SQL</strong></td><td><code style="background:#f5f5f5;padding:4px 8px;border-radius:4px;font-size:12px;display:block;">', FIX_SQL, '</code></td></tr>',
+                    '</table>',
+                    CASE WHEN FIX_APPROVAL_STATUS = 'PENDING' THEN
+                        CONCAT(
+                            '<div style="margin-top:12px;padding:10px;background:#fff8e1;border:1px solid #ffe082;border-radius:6px;">',
+                            '<strong>&#9997; Approve:</strong> <code>CALL OPS_AI_MONITOR.AI_ENGINE.SP_APPROVE_FIX(''', EVENT_ID, ''');</code><br>',
+                            '<strong>&#10060; Reject:</strong> <code>CALL OPS_AI_MONITOR.AI_ENGINE.SP_REJECT_FIX(''', EVENT_ID, ''', ''reason'');</code>',
+                            '</div>')
+                    ELSE '' END,
+                    '</div>'), ''
+            ) WITHIN GROUP (ORDER BY ALERT_FLAG, START_TIME DESC),
+            '</div>',
+            '<div style="background:#e3f2fd;padding:14px 24px;border-top:1px solid #bbdefb;">',
+            '<a href="https://app.snowflake.com/gqb30339/#/streamlit-apps/a753tuigfbe34dmmok3r" style="color:#1565c0;font-weight:bold;">&#128200; Open Dashboard</a>',
+            '</div>',
+            '<div style="background:#f5f5f5;padding:10px 24px;font-size:11px;color:#999;text-align:center;">',
+            'CoCo AI Monitor | HIGH severity fixes require approval | ', TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD HH24:MI:SS'), ' UTC',
+            '</div></div></body></html>'
+        ) INTO :ALERT_BODY
+        FROM OPS_AI_MONITOR.EVENT_LOGS.TMP_NEW_ALERTS;
+
+
+        CALL SYSTEM$SEND_EMAIL(
+            'OPS_ALERT_EMAIL', 'ritesh.i.meshram@kipi.ai',
+            CONCAT('CoCo ALERT: ', :ALERT_COUNT, ' HIGH Failure(s) | ', :PENDING_COUNT, ' Pending Approvals'),
+            :ALERT_BODY, 'text/html'
+        );
+
+
+        CALL SYSTEM$SEND_EMAIL(
+            'OPS_ALERT_EMAIL', 'ganesh.m.kori@kipi.ai',
+            CONCAT('CoCo ALERT: ', :ALERT_COUNT, ' HIGH Failure(s) | ', :PENDING_COUNT, ' Pending Approvals'),
+            :ALERT_BODY, 'text/html'
+        );
+
+
+        -- === SLACK Block Kit (JSON-safe, rich formatting) ===
+        SELECT LISTAGG(
+            CONCAT(
+                '*', ALERT_FLAG, ' | ', PIPELINE_NAME, '* (', PIPELINE_TYPE, ')\\n',
+                '>*Error:* ', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LEFT(ERROR_SNIPPET, 150), CHR(10), ' '), CHR(13), ' '), CHR(9), ' '), '"', ''''), '\\', ''), '\\n',
+                '>*Root Cause:* ', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LEFT(ROOT_CAUSE, 120), CHR(10), ' '), CHR(13), ' '), CHR(9), ' '), '"', ''''), '\\', ''), '\\n',
+                '>*Fix:* ', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LEFT(SUGGESTED_FIX, 120), CHR(10), ' '), CHR(13), ' '), CHR(9), ' '), '"', ''''), '\\', ''), '\\n',
+                '>*SQL:* `', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LEFT(FIX_SQL, 80), CHR(10), ' '), CHR(13), ' '), CHR(9), ' '), '"', ''''), '\\', ''), '`\\n',
+                '>*Status:* ', COALESCE(FIX_APPROVAL_STATUS, 'NOT QUEUED')
+            ),
+            '\\n\\n'
+        ) WITHIN GROUP (ORDER BY ALERT_FLAG, START_TIME DESC)
+        INTO :ALERT_DETAIL
+        FROM OPS_AI_MONITOR.EVENT_LOGS.TMP_NEW_ALERTS;
+
+
+        SLACK_BLOCKS := CONCAT(
+            '{"blocks":[',
+                '{"type":"header","text":{"type":"plain_text","text":"CoCo Pipeline Alert","emoji":true}},',
+                '{"type":"section","text":{"type":"mrkdwn","text":"*', :ALERT_COUNT, ' HIGH severity failure(s) detected*\\n', :PENDING_COUNT, ' fix(es) awaiting approval"}},',
+                '{"type":"divider"},',
+                '{"type":"section","text":{"type":"mrkdwn","text":"', :ALERT_DETAIL, '"}},',
+                '{"type":"divider"},',
+                '{"type":"section","text":{"type":"mrkdwn","text":"<https://app.snowflake.com/gqb30339/#/streamlit-apps/a753tuigfbe34dmmok3r|Open Dashboard - Fix Approvals>\\n`CALL OPS_AI_MONITOR.AI_ENGINE.SP_APPROVE_FIX(event_id);`"}},',
+                '{"type":"context","elements":[{"type":"mrkdwn","text":"CoCo AI Monitor | Fixes will NOT auto-execute until approved"}]}',
+            ']}'
+        );
+
+
+        CALL SYSTEM$SEND_SNOWFLAKE_NOTIFICATION(
+            SNOWFLAKE.NOTIFICATION.APPLICATION_JSON(:SLACK_BLOCKS),
+            SNOWFLAKE.NOTIFICATION.INTEGRATION('OPS_SLACK_ALERTS')
+        );
+
+
+        INSERT INTO OPS_AI_MONITOR.AI_ENGINE.ALERT_LOG (EVENT_ID, ALERT_FLAG, ISSUE_TYPE)
+        SELECT EVENT_ID, ALERT_FLAG, ISSUE_TYPE FROM OPS_AI_MONITOR.EVENT_LOGS.TMP_NEW_ALERTS;
+    END IF;
+
+
+    DROP TABLE IF EXISTS OPS_AI_MONITOR.EVENT_LOGS.TMP_NEW_ALERTS;
+    RETURN CONCAT(:ALERT_COUNT, ' alerts sent (2 emails + Slack) | ', :PENDING_COUNT, ' pending approvals');
+END;
+
+
+-- === HIL: ROUTE FIXES TO APPROVAL QUEUE ===
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_ROUTE_FIXES
+    WAREHOUSE = OPS_MONITOR_WH
+    COMMENT = 'Routes AI-generated fixes to approval queue. HIGH=manual, MEDIUM=manual if confidence<0.9, LOW=auto-approve'
+    AFTER OPS_AI_MONITOR.EVENT_LOGS.TSK_AI_ANALYZE
+AS
+    MERGE INTO OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE AS TGT
+    USING (
+        SELECT
+            EA.EVENT_ID,
+            FE.SOURCE_TYPE AS PIPELINE_TYPE,
+            EA.SEVERITY,
+            EA.CONFIDENCE_SCORE,
+            EA.ROOT_CAUSE,
+            EA.SUGGESTED_FIX,
+            EA.FIX_SQL,
+            CASE
+                WHEN EA.SEVERITY = 'HIGH' THEN 'MANUAL'
+                WHEN EA.SEVERITY = 'MEDIUM' AND EA.CONFIDENCE_SCORE < 0.9 THEN 'MANUAL'
+                WHEN EA.SEVERITY = 'MEDIUM' AND EA.CONFIDENCE_SCORE >= 0.9 THEN 'AUTO'
+                WHEN EA.SEVERITY = 'LOW' AND EA.CONFIDENCE_SCORE >= 0.8 THEN 'AUTO'
+                ELSE 'MANUAL'
+            END AS POLICY,
+            CASE
+                WHEN EA.SEVERITY = 'LOW' AND EA.CONFIDENCE_SCORE >= 0.8 THEN 'AUTO_APPROVED'
+                WHEN EA.SEVERITY = 'MEDIUM' AND EA.CONFIDENCE_SCORE >= 0.9 THEN 'AUTO_APPROVED'
+                ELSE 'PENDING'
+            END AS INITIAL_STATUS
+        FROM OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA
+        JOIN OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+            ON EA.EVENT_ID = FE.EVENT_ID
+        WHERE EA.STATUS = 'SUCCESS'
+          AND EA.FIX_SQL IS NOT NULL
+          AND TRIM(EA.FIX_SQL) != ''
+          AND UPPER(EA.FIX_SQL) NOT LIKE '%DROP %'
+          AND UPPER(EA.FIX_SQL) NOT LIKE '%DELETE %'
+          AND UPPER(EA.FIX_SQL) NOT LIKE '%TRUNCATE %'
+          AND EA.CREATED_AT >= DATEADD('HOUR', -2, CURRENT_TIMESTAMP())
+    ) AS SRC
+        ON TGT.EVENT_ID = SRC.EVENT_ID
+    WHEN NOT MATCHED THEN INSERT (
+        EVENT_ID, PIPELINE_TYPE, SEVERITY, CONFIDENCE_SCORE,
+        ROOT_CAUSE, SUGGESTED_FIX, FIX_SQL,
+        APPROVAL_STATUS, APPROVAL_POLICY,
+        APPROVED_BY, APPROVED_AT
+    ) VALUES (
+        SRC.EVENT_ID, SRC.PIPELINE_TYPE, SRC.SEVERITY, SRC.CONFIDENCE_SCORE,
+        SRC.ROOT_CAUSE, SRC.SUGGESTED_FIX, SRC.FIX_SQL,
+        SRC.INITIAL_STATUS, SRC.POLICY,
+        CASE WHEN SRC.INITIAL_STATUS = 'AUTO_APPROVED' THEN 'SYSTEM' ELSE NULL END,
+        CASE WHEN SRC.INITIAL_STATUS = 'AUTO_APPROVED' THEN CURRENT_TIMESTAMP() ELSE NULL END
+    );
+
+
+-- === HIL: AUTO-FIX (ONLY APPROVED) ===
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_AUTO_FIX
+    WAREHOUSE = OPS_MONITOR_WH
+    COMMENT = 'Executes ONLY approved fixes from FIX_APPROVAL_QUEUE (human-approved or auto-approved)'
+    AFTER OPS_AI_MONITOR.EVENT_LOGS.TSK_ROUTE_FIXES
+AS
+DECLARE
+    C1 CURSOR FOR
+        SELECT FAQ.APPROVAL_ID, FAQ.EVENT_ID, FAQ.FIX_SQL
+        FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE FAQ
+        LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS AFL
+            ON FAQ.EVENT_ID = AFL.EVENT_ID
+        WHERE FAQ.APPROVAL_STATUS IN ('APPROVED', 'AUTO_APPROVED')
+          AND FAQ.EXECUTED = FALSE
+          AND AFL.EVENT_ID IS NULL
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%DROP %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%DELETE %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%TRUNCATE %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%INSERT %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%UPDATE %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%MERGE %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%CREATE OR REPLACE %'
+          AND UPPER(FAQ.FIX_SQL) NOT LIKE '%REVOKE %'
+        ORDER BY FAQ.APPROVED_AT ASC
+        LIMIT 5;
+    V_APPROVAL_ID VARCHAR;
+    V_EVENT_ID    VARCHAR;
+    V_FIX_SQL     VARCHAR;
+BEGIN
+    OPEN C1;
+    FOR REC IN C1 DO
+        V_APPROVAL_ID := REC.APPROVAL_ID;
+        V_EVENT_ID    := REC.EVENT_ID;
+        V_FIX_SQL     := REC.FIX_SQL;
+        BEGIN
+            EXECUTE IMMEDIATE :V_FIX_SQL;
+
+
+            INSERT INTO OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS
+                (EVENT_ID, FIX_SQL, EXECUTION_STATUS)
+            VALUES (:V_EVENT_ID, :V_FIX_SQL, 'SUCCESS');
+
+
+            UPDATE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+            SET EXECUTED = TRUE
+            WHERE APPROVAL_ID = :V_APPROVAL_ID;
+        EXCEPTION
+            WHEN OTHER THEN
+                INSERT INTO OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS
+                    (EVENT_ID, FIX_SQL, EXECUTION_STATUS, ERROR_MESSAGE)
+                VALUES (:V_EVENT_ID, :V_FIX_SQL, 'FAILED', SQLERRM);
+
+
+                UPDATE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+                SET EXECUTED = TRUE
+                WHERE APPROVAL_ID = :V_APPROVAL_ID;
+        END;
+    END FOR;
+    CLOSE C1;
+END;
+
+
+-- === HIL: APPROVAL PROCEDURES ===
+CREATE OR REPLACE PROCEDURE OPS_AI_MONITOR.AI_ENGINE.SP_APPROVE_FIX(P_EVENT_ID VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+DECLARE
+    V_COUNT INT;
+BEGIN
+    SELECT COUNT(*) INTO :V_COUNT
+    FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+    WHERE EVENT_ID = :P_EVENT_ID AND APPROVAL_STATUS = 'PENDING';
+    IF (:V_COUNT = 0) THEN
+        RETURN 'No pending fix found for event: ' || :P_EVENT_ID;
+    END IF;
+    UPDATE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+    SET APPROVAL_STATUS = 'APPROVED',
+        APPROVED_BY = CURRENT_USER(),
+        APPROVED_AT = CURRENT_TIMESTAMP()
+    WHERE EVENT_ID = :P_EVENT_ID AND APPROVAL_STATUS = 'PENDING';
+    RETURN 'APPROVED by ' || CURRENT_USER() || ' — fix will execute on next TSK_AUTO_FIX run';
+END;
+
+
+CREATE OR REPLACE PROCEDURE OPS_AI_MONITOR.AI_ENGINE.SP_REJECT_FIX(P_EVENT_ID VARCHAR, P_REASON VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+DECLARE
+    V_COUNT INT;
+BEGIN
+    SELECT COUNT(*) INTO :V_COUNT
+    FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+    WHERE EVENT_ID = :P_EVENT_ID AND APPROVAL_STATUS = 'PENDING';
+    IF (:V_COUNT = 0) THEN
+        RETURN 'No pending fix found for event: ' || :P_EVENT_ID;
+    END IF;
+    UPDATE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+    SET APPROVAL_STATUS = 'REJECTED',
+        APPROVED_BY = CURRENT_USER(),
+        APPROVED_AT = CURRENT_TIMESTAMP(),
+        REJECTION_REASON = :P_REASON
+    WHERE EVENT_ID = :P_EVENT_ID AND APPROVAL_STATUS = 'PENDING';
+    RETURN 'REJECTED by ' || CURRENT_USER() || ' — Reason: ' || :P_REASON;
+END;
+
+
+CREATE OR REPLACE PROCEDURE OPS_AI_MONITOR.AI_ENGINE.SP_BULK_APPROVE(P_SEVERITY VARCHAR DEFAULT NULL)
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+DECLARE
+    V_COUNT INT;
+BEGIN
+    IF (:P_SEVERITY IS NOT NULL) THEN
+        UPDATE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+        SET APPROVAL_STATUS = 'APPROVED',
+            APPROVED_BY = CURRENT_USER(),
+            APPROVED_AT = CURRENT_TIMESTAMP()
+        WHERE APPROVAL_STATUS = 'PENDING' AND SEVERITY = :P_SEVERITY;
+    ELSE
+        UPDATE OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+        SET APPROVAL_STATUS = 'APPROVED',
+            APPROVED_BY = CURRENT_USER(),
+            APPROVED_AT = CURRENT_TIMESTAMP()
+        WHERE APPROVAL_STATUS = 'PENDING';
+    END IF;
+    V_COUNT := SQLROWCOUNT;
+    RETURN :V_COUNT || ' fixes approved by ' || CURRENT_USER();
+END;
+
+
+-- === HIL: VIEWS ===
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_PENDING_APPROVALS AS
+SELECT
+    APPROVAL_ID, EVENT_ID, PIPELINE_TYPE, SEVERITY,
+    ROUND(CONFIDENCE_SCORE * 100, 1) AS CONFIDENCE_PCT,
+    LEFT(ROOT_CAUSE, 200) AS ROOT_CAUSE,
+    LEFT(SUGGESTED_FIX, 200) AS SUGGESTED_FIX,
+    FIX_SQL, APPROVAL_POLICY, CREATED_AT,
+    DATEDIFF('MINUTE', CREATED_AT, CURRENT_TIMESTAMP()) AS WAITING_MINUTES
+FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+WHERE APPROVAL_STATUS = 'PENDING'
+ORDER BY CASE SEVERITY WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, CREATED_AT ASC;
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_APPROVAL_STATS AS
+SELECT
+    APPROVAL_STATUS, SEVERITY, COUNT(*) AS CNT,
+    AVG(CONFIDENCE_SCORE) AS AVG_CONFIDENCE,
+    AVG(CASE WHEN APPROVED_AT IS NOT NULL THEN DATEDIFF('MINUTE', CREATED_AT, APPROVED_AT) END) AS AVG_APPROVAL_MINUTES
+FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE
+GROUP BY APPROVAL_STATUS, SEVERITY
+ORDER BY APPROVAL_STATUS, SEVERITY;
+
+
+-- === POST-FIX VALIDATION: TASK ===
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_VALIDATE_FIXES
+    WAREHOUSE = OPS_MONITOR_WH
+    COMMENT = 'Post-fix validation: generates and runs health checks after AI fixes execute'
+    AFTER OPS_AI_MONITOR.EVENT_LOGS.TSK_AUTO_FIX
+AS
+DECLARE
+    C1 CURSOR FOR
+        SELECT
+            AFL.EVENT_ID,
+            AFL.FIX_SQL,
+            LEFT(FE.ERROR_MESSAGE, 500) AS ORIGINAL_ERROR,
+            LEFT(COALESCE(FE.QUERY_TEXT, ''), 500) AS ORIGINAL_QUERY
+        FROM OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS AFL
+        JOIN OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE
+            ON AFL.EVENT_ID = FE.EVENT_ID
+        LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION PFV
+            ON AFL.EVENT_ID = PFV.EVENT_ID
+        WHERE AFL.EXECUTION_STATUS = 'SUCCESS'
+          AND PFV.EVENT_ID IS NULL
+          AND AFL.EXECUTED_AT >= DATEADD('HOUR', -2, CURRENT_TIMESTAMP())
+        ORDER BY AFL.EXECUTED_AT DESC
+        LIMIT 5;
+    V_EVENT_ID       VARCHAR;
+    V_FIX_SQL        VARCHAR;
+    V_ORIGINAL_ERROR VARCHAR;
+    V_ORIGINAL_QUERY VARCHAR;
+    V_TEST_QUERY     VARCHAR;
+    V_TEST_RESULT    VARCHAR;
+    V_STATUS         VARCHAR;
+    V_VERDICT        VARCHAR;
+BEGIN
+    OPEN C1;
+    FOR REC IN C1 DO
+        V_EVENT_ID       := REC.EVENT_ID;
+        V_FIX_SQL        := REC.FIX_SQL;
+        V_ORIGINAL_ERROR := REC.ORIGINAL_ERROR;
+        V_ORIGINAL_QUERY := REC.ORIGINAL_QUERY;
+        V_TEST_QUERY     := NULL;
+        V_TEST_RESULT    := NULL;
+        V_STATUS         := 'PENDING';
+        V_VERDICT        := NULL;
+        BEGIN
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                'mistral-large2',
+                CONCAT(
+                    'You are a Snowflake SQL validation expert. Generate a single SELECT query to verify a fix was successful.',
+                    ' The query must be safe (read-only SELECT only, no DML). Return ONLY the SQL, nothing else.',
+                    ' If you cannot generate a validation query, return: SELECT 1 AS VALIDATION_OK;',
+                    ' ORIGINAL ERROR: ', :V_ORIGINAL_ERROR,
+                    ' FIX APPLIED: ', :V_FIX_SQL,
+                    ' ORIGINAL QUERY: ', :V_ORIGINAL_QUERY
+                )
+            ) INTO :V_TEST_QUERY;
+            V_TEST_QUERY := TRIM(:V_TEST_QUERY);
+            IF (LEFT(:V_TEST_QUERY, 3) = '```') THEN
+                V_TEST_QUERY := TRIM(REGEXP_REPLACE(:V_TEST_QUERY, '```[a-z]*', ''));
+            END IF;
+            IF (UPPER(LEFT(TRIM(:V_TEST_QUERY), 6)) != 'SELECT') THEN
+                V_TEST_QUERY := 'SELECT 1 AS VALIDATION_OK';
+            END IF;
+            IF (UPPER(:V_TEST_QUERY) LIKE '%DROP %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%DELETE %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%INSERT %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%UPDATE %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%MERGE %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%CREATE %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%ALTER %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%GRANT %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%REVOKE %'
+                OR UPPER(:V_TEST_QUERY) LIKE '%TRUNCATE %')
+            THEN
+                V_TEST_QUERY  := 'SELECT ''UNSAFE_QUERY_BLOCKED'' AS RESULT';
+                V_TEST_RESULT := 'AI generated unsafe validation query - blocked';
+                V_STATUS      := 'SKIPPED';
+                V_VERDICT     := 'VALIDATION_BLOCKED';
+            ELSE
+                BEGIN
+                    EXECUTE IMMEDIATE :V_TEST_QUERY;
+                    V_TEST_RESULT := 'Query executed successfully';
+                    V_STATUS      := 'SUCCESS';
+                    V_VERDICT     := 'FIX_VERIFIED';
+                EXCEPTION
+                    WHEN OTHER THEN
+                        V_TEST_RESULT := SQLERRM;
+                        IF (POSITION(:V_ORIGINAL_ERROR IN SQLERRM) > 0
+                            OR SQLERRM ILIKE '%does not exist%'
+                            OR SQLERRM ILIKE '%not authorized%'
+                            OR SQLERRM ILIKE '%compilation error%') THEN
+                            V_STATUS  := 'FAILED';
+                            V_VERDICT := 'FIX_FAILED';
+                        ELSE
+                            V_STATUS  := 'PARTIAL';
+                            V_VERDICT := 'FIX_PARTIAL';
+                        END IF;
+                END;
+            END IF;
+        EXCEPTION
+            WHEN OTHER THEN
+                V_TEST_QUERY  := 'N/A - validation generation failed';
+                V_TEST_RESULT := SQLERRM;
+                V_STATUS      := 'ERROR';
+                V_VERDICT     := 'VALIDATION_ERROR';
+        END;
+        INSERT INTO OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION
+            (EVENT_ID, FIX_SQL, TEST_QUERY, TEST_RESULT, VALIDATION_STATUS, VALIDATION_VERDICT, ORIGINAL_ERROR, ORIGINAL_QUERY)
+        VALUES
+            (:V_EVENT_ID, :V_FIX_SQL, :V_TEST_QUERY, :V_TEST_RESULT, :V_STATUS, :V_VERDICT, :V_ORIGINAL_ERROR, :V_ORIGINAL_QUERY);
+    END FOR;
+    CLOSE C1;
+END;
+
+
+-- === POST-FIX VALIDATION: REPORT TASK ===
+CREATE OR REPLACE TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_SEND_VALIDATION_REPORT
+    WAREHOUSE = OPS_MONITOR_WH
+    COMMENT = 'Sends post-fix validation summary via email + Slack'
+    AFTER OPS_AI_MONITOR.EVENT_LOGS.TSK_VALIDATE_FIXES
+AS
+DECLARE
+    V_COUNT        INT;
+    V_SUCCESS      INT;
+    V_FAILED       INT;
+    V_PARTIAL      INT;
+    EMAIL_BODY     VARCHAR;
+    SLACK_BLOCKS   VARCHAR;
+    SLACK_DETAIL   VARCHAR;
+BEGIN
+    SELECT
+        COUNT(*),
+        COUNT(CASE WHEN VALIDATION_STATUS = 'SUCCESS' THEN 1 END),
+        COUNT(CASE WHEN VALIDATION_STATUS = 'FAILED' THEN 1 END),
+        COUNT(CASE WHEN VALIDATION_STATUS = 'PARTIAL' THEN 1 END)
+    INTO :V_COUNT, :V_SUCCESS, :V_FAILED, :V_PARTIAL
+    FROM OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION
+    WHERE VALIDATED_AT >= DATEADD('MINUTE', -10, CURRENT_TIMESTAMP());
+
+
+    IF (:V_COUNT > 0) THEN
+        SELECT CONCAT(
+            '<html><body style="font-family:Arial,sans-serif;background:#f4f4f4;padding:20px;">',
+            '<div style="max-width:600px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">',
+            '<div style="background:#1565c0;color:#fff;padding:16px 24px;">',
+            '<h3 style="margin:0;">Post-Fix Validation Report</h3>',
+            '<p style="margin:4px 0 0;">', :V_COUNT, ' fix(es) validated</p>',
+            '</div>',
+            '<div style="padding:16px 24px;">',
+            '<table style="width:100%;font-size:14px;border-collapse:collapse;">',
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;"><strong>Verified OK</strong></td><td style="padding:8px;border-bottom:1px solid #eee;color:#2e7d32;font-weight:bold;">', :V_SUCCESS, '</td></tr>',
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;"><strong>Partial</strong></td><td style="padding:8px;border-bottom:1px solid #eee;color:#f57c00;font-weight:bold;">', :V_PARTIAL, '</td></tr>',
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;"><strong>Failed</strong></td><td style="padding:8px;border-bottom:1px solid #eee;color:#d32f2f;font-weight:bold;">', :V_FAILED, '</td></tr>',
+            '</table>',
+            LISTAGG(
+                CONCAT(
+                    '<div style="margin-top:12px;padding:12px;border:1px solid #e0e0e0;border-radius:6px;background:#fafafa;">',
+                    '<span style="background:',
+                        CASE WHEN PFV.VALIDATION_STATUS = 'SUCCESS' THEN '#2e7d32'
+                             WHEN PFV.VALIDATION_STATUS = 'FAILED' THEN '#d32f2f'
+                             ELSE '#f57c00' END,
+                        ';color:#fff;padding:2px 8px;border-radius:10px;font-size:12px;">', PFV.VALIDATION_VERDICT, '</span>',
+                    '<p style="margin:8px 0 4px;font-size:13px;color:#666;"><strong>Pipeline:</strong> ', COALESCE(VE.PIPELINE_NAME, 'N/A'), ' (', COALESCE(VE.PIPELINE_TYPE, 'N/A'), ')</p>',
+                    '<p style="margin:4px 0;font-size:13px;color:#666;"><strong>Fix:</strong> ', LEFT(PFV.FIX_SQL, 120), '</p>',
+                    '<p style="margin:0;font-size:13px;color:#666;"><strong>Result:</strong> ', LEFT(PFV.TEST_RESULT, 150), '</p>',
+                    '</div>'
+                ),
+                ''
+            ) WITHIN GROUP (ORDER BY PFV.VALIDATED_AT DESC),
+            '</div>',
+            '<div style="background:#e3f2fd;padding:14px 24px;border-top:1px solid #bbdefb;">',
+            '<a href="https://app.snowflake.com/gqb30339/#/streamlit-apps/a753tuigfbe34dmmok3r" style="color:#1565c0;font-weight:bold;">&#128200; Open Dashboard</a>',
+            '</div>',
+            '<div style="background:#f5f5f5;padding:10px 24px;font-size:11px;color:#999;text-align:center;">',
+            'CoCo Post-Fix Validator | ', TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD HH24:MI'), ' UTC</div>',
+            '</div></body></html>'
+        ) INTO :EMAIL_BODY
+        FROM OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION PFV
+        LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED VE ON PFV.EVENT_ID = VE.EVENT_ID
+        WHERE PFV.VALIDATED_AT >= DATEADD('MINUTE', -10, CURRENT_TIMESTAMP());
+
+
+        CALL SYSTEM$SEND_EMAIL(
+            'OPS_ALERT_EMAIL',
+            'ritesh.i.meshram@kipi.ai',
+            CONCAT('CoCo Validation: ', :V_SUCCESS, ' OK / ', :V_FAILED, ' Failed / ', :V_PARTIAL, ' Partial'),
+            :EMAIL_BODY,
+            'text/html'
+        );
+
+
+        CALL SYSTEM$SEND_EMAIL(
+            'OPS_ALERT_EMAIL',
+            'ganesh.m.kori@kipi.ai',
+            CONCAT('CoCo Validation: ', :V_SUCCESS, ' OK / ', :V_FAILED, ' Failed / ', :V_PARTIAL, ' Partial'),
+            :EMAIL_BODY,
+            'text/html'
+        );
+
+
+        -- === SLACK Block Kit (JSON-safe, rich formatting) ===
+        SELECT LISTAGG(
+            CONCAT(
+                '*', PFV.VALIDATION_VERDICT, '* | ', COALESCE(VE.PIPELINE_NAME, 'N/A'), ' (', COALESCE(VE.PIPELINE_TYPE, 'N/A'), ')\\n',
+                '>*Fix:* `', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LEFT(PFV.FIX_SQL, 80), CHR(10), ' '), CHR(13), ' '), CHR(9), ' '), '"', ''''), '\\', ''), '`\\n',
+                '>*Result:* ', REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LEFT(PFV.TEST_RESULT, 100), CHR(10), ' '), CHR(13), ' '), CHR(9), ' '), '"', ''''), '\\', '')
+            ),
+            '\\n\\n'
+        ) WITHIN GROUP (ORDER BY PFV.VALIDATED_AT DESC)
+        INTO :SLACK_DETAIL
+        FROM OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION PFV
+        LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED VE ON PFV.EVENT_ID = VE.EVENT_ID
+        WHERE PFV.VALIDATED_AT >= DATEADD('MINUTE', -10, CURRENT_TIMESTAMP());
+
+
+        SLACK_BLOCKS := CONCAT(
+            '{"blocks":[',
+                '{"type":"header","text":{"type":"plain_text","text":"CoCo Post-Fix Validation","emoji":true}},',
+                '{"type":"section","text":{"type":"mrkdwn","text":"*', :V_COUNT, ' fix(es) validated:* ', :V_SUCCESS, ' OK, ', :V_FAILED, ' Failed, ', :V_PARTIAL, ' Partial"}},',
+                '{"type":"divider"},',
+                '{"type":"section","text":{"type":"mrkdwn","text":"', :SLACK_DETAIL, '"}},',
+                '{"type":"divider"},',
+                '{"type":"section","text":{"type":"mrkdwn","text":"<https://app.snowflake.com/gqb30339/#/streamlit-apps/a753tuigfbe34dmmok3r|Open Dashboard - Validation Tab>"}},',
+                '{"type":"context","elements":[{"type":"mrkdwn","text":"CoCo Post-Fix Validator"}]}',
+            ']}'
+        );
+
+
+        CALL SYSTEM$SEND_SNOWFLAKE_NOTIFICATION(
+            SNOWFLAKE.NOTIFICATION.APPLICATION_JSON(:SLACK_BLOCKS),
+            SNOWFLAKE.NOTIFICATION.INTEGRATION('OPS_SLACK_ALERTS')
+        );
+    END IF;
+    RETURN CONCAT(:V_COUNT, ' validations reported (', :V_SUCCESS, ' OK / ', :V_FAILED, ' failed)');
+END;
+
+
+-- === POST-FIX VALIDATION: VIEWS ===
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_VALIDATION_SUMMARY AS
+SELECT
+    PFV.VALIDATION_ID, PFV.EVENT_ID,
+    FE.SOURCE_TYPE AS PIPELINE_TYPE, EA.SEVERITY,
+    PFV.VALIDATION_STATUS, PFV.VALIDATION_VERDICT,
+    PFV.FIX_SQL, PFV.TEST_QUERY, PFV.TEST_RESULT,
+    LEFT(PFV.ORIGINAL_ERROR, 200) AS ORIGINAL_ERROR,
+    PFV.VALIDATED_AT
+FROM OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION PFV
+LEFT JOIN OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS FE ON PFV.EVENT_ID = FE.EVENT_ID
+LEFT JOIN OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS EA ON PFV.EVENT_ID = EA.EVENT_ID
+ORDER BY PFV.VALIDATED_AT DESC;
+
+
+CREATE OR REPLACE VIEW OPS_AI_MONITOR.AI_ENGINE.V_VALIDATION_METRICS AS
+SELECT
+    COUNT(*) AS TOTAL_VALIDATIONS,
+    COUNT(CASE WHEN VALIDATION_STATUS = 'SUCCESS' THEN 1 END) AS VERIFIED_OK,
+    COUNT(CASE WHEN VALIDATION_STATUS = 'PARTIAL' THEN 1 END) AS PARTIAL,
+    COUNT(CASE WHEN VALIDATION_STATUS = 'FAILED' THEN 1 END) AS FAILED,
+    COUNT(CASE WHEN VALIDATION_STATUS = 'SKIPPED' THEN 1 END) AS SKIPPED,
+    ROUND(COUNT(CASE WHEN VALIDATION_STATUS = 'SUCCESS' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 1) AS SUCCESS_RATE_PCT
+FROM OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION;
+
+
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_SEND_VALIDATION_REPORT RESUME;
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_VALIDATE_FIXES RESUME;
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_AUTO_FIX RESUME;
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_ROUTE_FIXES RESUME;
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_SEND_ALERTS RESUME;
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_AI_ANALYZE RESUME;
+ALTER TASK OPS_AI_MONITOR.EVENT_LOGS.TSK_INGEST_FAILURES RESUME;
+
+
+-- ============================================================================
+-- SECTION 9: STREAMLIT DASHBOARD
+-- ============================================================================
+
+
+CREATE STAGE IF NOT EXISTS OPS_AI_MONITOR.AI_ENGINE.STREAMLIT_STAGE;
+
+
+CREATE OR REPLACE STREAMLIT OPS_AI_MONITOR.AI_ENGINE.FAILURE_DASHBOARD
+    FROM '@OPS_AI_MONITOR.AI_ENGINE.STREAMLIT_STAGE'
+    MAIN_FILE = 'streamlit_app.py'
+    COMMENT = 'Cortex SentinAI dashboard with CoCo AI assistant';
+
+
+ALTER STREAMLIT OPS_AI_MONITOR.AI_ENGINE.FAILURE_DASHBOARD
+    SET QUERY_WAREHOUSE = OPS_MONITOR_WH;
+
+
+-- ============================================================================
+-- SECTION 10: CUSTOM LOGS SAMPLE DATA (Fivetran / dbt / custom ETL)
+-- ============================================================================
+
+
+INSERT INTO OPS_AI_MONITOR.EVENT_LOGS.CUSTOM_LOGS
+    (PIPELINE_NAME, SOURCE_SYSTEM, ERROR_MESSAGE, QUERY_TEXT, STATUS, DATABASE_NAME, SCHEMA_NAME, START_TIME)
+VALUES
+    ('fivetran_salesforce_sync', 'FIVETRAN',
+     'Connection timeout: Salesforce API did not respond within 120 seconds',
+     'SYNC salesforce.accounts -> RAW.SALESFORCE_ACCOUNTS', 'FAILED',
+     'RAW', 'SALESFORCE', DATEADD('MINUTES', -45, CURRENT_TIMESTAMP())),
+
+
+    ('fivetran_stripe_sync', 'FIVETRAN',
+     'Schema drift detected: column payment_method_id removed from source',
+     'SYNC stripe.payments -> RAW.STRIPE_PAYMENTS', 'FAILED',
+     'RAW', 'STRIPE', DATEADD('MINUTES', -30, CURRENT_TIMESTAMP())),
+
+
+    ('fivetran_hubspot_sync', 'FIVETRAN',
+     'Rate limit exceeded: HubSpot API returned HTTP 429',
+     'SYNC hubspot.contacts -> RAW.HUBSPOT_CONTACTS', 'FAILED',
+     'RAW', 'HUBSPOT', DATEADD('MINUTES', -15, CURRENT_TIMESTAMP())),
+
+
+    ('dbt_stg_orders', 'DBT',
+     'Compilation Error: Model stg_orders depends on source raw.orders which was not found',
+     'dbt run --select stg_orders', 'FAILED',
+     'ANALYTICS', 'STAGING', DATEADD('HOURS', -2, CURRENT_TIMESTAMP())),
+
+
+    ('dbt_fct_revenue', 'DBT',
+     'Database Error: Division by zero in model fct_revenue at line 42',
+     'SELECT order_total / NULLIF(order_count, 0) FROM analytics.staging.stg_orders', 'FAILED',
+     'ANALYTICS', 'MARTS', DATEADD('HOURS', -1, CURRENT_TIMESTAMP())),
+
+
+    ('dbt_test_unique_order_id', 'DBT',
+     'Failure in test unique_order_id: Got 23 results, configured to fail if != 0',
+     'dbt test --select unique_order_id', 'FAILED',
+     'ANALYTICS', 'TESTS', DATEADD('MINUTES', -50, CURRENT_TIMESTAMP())),
+
+
+    ('custom_etl_inventory_load', 'CUSTOM',
+     'COPY INTO failed: field delimiter mismatch in file inventory_20260320.csv',
+     'COPY INTO WAREHOUSE_DB.PUBLIC.INVENTORY FROM @S3_STAGE/inventory_20260320.csv', 'FAILED',
+     'WAREHOUSE_DB', 'PUBLIC', DATEADD('HOURS', -3, CURRENT_TIMESTAMP())),
+
+
+    ('custom_etl_user_merge', 'CUSTOM',
+     'Insufficient privileges to insert into PROD.CORE.DIM_USERS',
+     'MERGE INTO PROD.CORE.DIM_USERS USING RAW.CRM.USERS ON user_id = user_id', 'FAILED',
+     'PROD', 'CORE', DATEADD('MINUTES', -90, CURRENT_TIMESTAMP())),
+
+
+    ('custom_spark_ingest', 'CUSTOM',
+     'Java heap space: OutOfMemoryError during Spark write to Snowflake stage',
+     'spark.write.format("snowflake").option("dbtable","events").save()', 'FAILED',
+     'RAW', 'EVENTS', DATEADD('HOURS', -4, CURRENT_TIMESTAMP())),
+
+
+    ('fivetran_postgres_sync', 'FIVETRAN',
+     'SSL certificate verification failed for source database pg-prod-replica.internal:5432',
+     'SYNC postgres.users -> RAW.POSTGRES_USERS', 'FAILED',
+     'RAW', 'POSTGRES', DATEADD('MINUTES', -10, CURRENT_TIMESTAMP()));
+
+
+-- ============================================================================
+-- SECTION 11: DEMO ERRORS (intentional failures for testing)
+-- ============================================================================
+
+
+CREATE OR REPLACE TABLE OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE (ID INT, NAME VARCHAR);
+INSERT INTO OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE VALUES (1, 'test');
+
+
+CREATE OR REPLACE TASK OPS_AI_MONITOR.DEMO_ERRORS.TSK_DEMO_FAIL
+    WAREHOUSE = OPS_MONITOR_WH
+    SCHEDULE = '1 MINUTE'
+    SUSPEND_TASK_AFTER_NUM_FAILURES = 1
+    COMMENT = 'Demo task that intentionally fails'
+AS
+    SELECT * FROM OPS_AI_MONITOR.DEMO_ERRORS.TABLE_THAT_DOES_NOT_EXIST_DEMO;
+
+
+ALTER TASK OPS_AI_MONITOR.DEMO_ERRORS.TSK_DEMO_FAIL RESUME;
+
+
+CREATE OR REPLACE PROCEDURE OPS_AI_MONITOR.DEMO_ERRORS.SP_DEMO_FAIL()
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+BEGIN
+    SELECT * FROM OPS_AI_MONITOR.DEMO_ERRORS.NONEXISTENT_TABLE_FOR_SP_DEMO;
+END;
+
+
+CALL OPS_AI_MONITOR.DEMO_ERRORS.SP_DEMO_FAIL();
+
+
+CREATE OR REPLACE FUNCTION OPS_AI_MONITOR.DEMO_ERRORS.FN_DEMO_FAIL(X INT)
+RETURNS INT
+LANGUAGE SQL
+AS 'X / 0';
+
+
+SELECT OPS_AI_MONITOR.DEMO_ERRORS.FN_DEMO_FAIL(42);
+
+
+CREATE OR REPLACE DYNAMIC TABLE OPS_AI_MONITOR.DEMO_ERRORS.DT_DEMO_FAIL
+    WAREHOUSE = OPS_MONITOR_WH
+    TARGET_LAG = '1 MINUTE'
+AS
+    SELECT ID, NAME, ID / (ID - 1) AS BAD_CALC FROM OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE;
+
+
+CREATE OR REPLACE STREAM OPS_AI_MONITOR.DEMO_ERRORS.STR_DEMO
+    ON TABLE OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE;
+
+
+SELECT NONEXISTENT_COL FROM OPS_AI_MONITOR.DEMO_ERRORS.STR_DEMO;
+
+
+INSERT INTO OPS_AI_MONITOR.EVENT_LOGS.STALE_STREAMS (STREAM_NAME, DATABASE_NAME, SCHEMA_NAME)
+VALUES ('DEMO_STALE_STREAM', 'PRODUCTION_DB', 'RAW_DATA');
+
+
+COPY INTO OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE
+FROM @OPS_AI_MONITOR.DEMO_ERRORS.NONEXISTENT_STAGE_DEMO/data.csv
+FILE_FORMAT = (TYPE = 'CSV');
+
+
+SELECT * FROM OPS_AI_MONITOR.DEMO_ERRORS.CUSTOMERS_THAT_DO_NOT_EXIST;
+SELEC * FORM OPS_AI_MONITOR.DEMO_ERRORS.DT_SOURCE WHER ID = 1;
+SELECT 100 / 0 AS DEMO_DIVISION_ERROR;
+SELECT TO_NUMBER('not_a_number_demo') AS BAD_CAST;
+
+
+-- ============================================================================
+-- SECTION 11B: P1 CRITICAL ALERT DEMO DATA (SLA breaches for HIGH severity)
+-- ============================================================================
+
+
+INSERT INTO OPS_AI_MONITOR.AI_ENGINE.SLA_DEMO_BREACHES
+    (EVENT_ID, PIPELINE_TYPE, SOURCE_TYPE, EXECUTION_TIME_SECONDS, SLA_STATUS, BREACH_REASON, ERROR_CATEGORY, SEVERITY, START_TIME)
+VALUES
+    ('sla-demo-001', 'DBT', 'DBT', 482.3, 'BREACHED', 'WARNING: exceeded SLA threshold (>5 min)', 'RUNTIME', 'HIGH', DATEADD('HOUR', -6, CURRENT_TIMESTAMP())),
+    ('sla-demo-002', 'TASK', 'TASK', 723.1, 'BREACHED', 'CRITICAL: exceeded 2x SLA (>10 min)', 'STALENESS', 'HIGH', DATEADD('HOUR', -8, CURRENT_TIMESTAMP())),
+    ('sla-demo-003', 'FIVETRAN', 'FIVETRAN', 390.5, 'BREACHED', 'WARNING: exceeded SLA threshold (>5 min)', 'CONNECTIVITY', 'MEDIUM', DATEADD('HOUR', -5, CURRENT_TIMESTAMP())),
+    ('sla-demo-004', 'CUSTOM_ETL', 'CUSTOM', 610.8, 'BREACHED', 'CRITICAL: exceeded 2x SLA (>10 min)', 'DATA_LOAD', 'HIGH', DATEADD('HOUR', -4, CURRENT_TIMESTAMP())),
+    ('sla-demo-005', 'SQL', 'QUERY_REALTIME', 310.2, 'BREACHED', 'WARNING: exceeded SLA threshold (>5 min)', 'RUNTIME', 'MEDIUM', DATEADD('HOUR', -7, CURRENT_TIMESTAMP()));
+
+
+-- ============================================================================
+-- SECTION 12: VERIFICATION QUERIES
+-- ============================================================================
+
+
+SHOW TASKS IN SCHEMA OPS_AI_MONITOR.EVENT_LOGS;
+
+
+SELECT NAME, STATE, PREDECESSORS
+FROM TABLE(OPS_AI_MONITOR.INFORMATION_SCHEMA.TASK_DEPENDENTS(
+    TASK_NAME => 'OPS_AI_MONITOR.EVENT_LOGS.TSK_INGEST_FAILURES',
+    RECURSIVE => TRUE
+));
+
+
+SELECT PIPELINE_TYPE, ERROR_CATEGORY, SEVERITY, COUNT(*) AS CNT
+FROM OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_INSIGHTS_ENRICHED
+GROUP BY PIPELINE_TYPE, ERROR_CATEGORY, SEVERITY
+ORDER BY PIPELINE_TYPE, CNT DESC;
+
+
+SELECT * FROM OPS_AI_MONITOR.AI_ENGINE.V_FAILURE_METRICS;
+SELECT * FROM OPS_AI_MONITOR.AI_ENGINE.V_SLA_SUMMARY;
+SELECT * FROM OPS_AI_MONITOR.AI_ENGINE.V_CRITICAL_ALERTS LIMIT 10;
+
+
+SELECT COUNT(*) AS TOTAL_FAILURES FROM OPS_AI_MONITOR.EVENT_LOGS.FAILURE_EVENTS;
+SELECT COUNT(*) AS AI_ANALYZED FROM OPS_AI_MONITOR.AI_ENGINE.ERROR_ANALYSIS WHERE STATUS = 'SUCCESS';
+SELECT COUNT(*) AS KB_PATTERNS FROM OPS_AI_MONITOR.METADATA.ERROR_KB;
+SELECT COUNT(*) AS PENDING FROM OPS_AI_MONITOR.AI_ENGINE.V_AI_QUEUE;
+SELECT COUNT(*) AS ALERTS_SENT FROM OPS_AI_MONITOR.AI_ENGINE.ALERT_LOG;
+SELECT COUNT(*) AS AUTO_FIXES FROM OPS_AI_MONITOR.AI_ENGINE.AUTO_FIX_LOGS;
+SELECT ALERT_FLAG, COUNT(*) AS CNT FROM OPS_AI_MONITOR.AI_ENGINE.V_CRITICAL_ALERTS GROUP BY ALERT_FLAG ORDER BY ALERT_FLAG;
+SELECT APPROVAL_STATUS, COUNT(*) AS CNT FROM OPS_AI_MONITOR.AI_ENGINE.FIX_APPROVAL_QUEUE GROUP BY APPROVAL_STATUS ORDER BY APPROVAL_STATUS;
+SELECT VALIDATION_STATUS, COUNT(*) AS CNT FROM OPS_AI_MONITOR.AI_ENGINE.POST_FIX_VALIDATION GROUP BY VALIDATION_STATUS;
